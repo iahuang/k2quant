@@ -1,4 +1,4 @@
-from pipeline import w_quantize, w_quantize_and_reconstruct
+from quant import w_quantize, w_quantize_and_reconstruct
 from core import QuantConfig, bcos
 
 __all__ = [

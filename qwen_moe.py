@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import k2quant
+from k2quant.util import get_calibration_data, evaluate_perplexity
 
 # ── Configuration ────────────────────────────────────────────────────────
 # Model
@@ -136,7 +137,7 @@ def main():
 
     # ── 2. Load calibration data ─────────────────────────────────────
     print("\n[2/5] Loading calibration data...")
-    calib_data = k2quant.get_calibration_data(
+    calib_data = get_calibration_data(
         tokenizer,
         nsamples=CALIB_NSAMPLES,
         seqlen=CALIB_SEQLEN,
@@ -299,7 +300,7 @@ def main():
 
     # ── 5. Evaluate ──────────────────────────────────────────────────
     print("\n[5/5] Evaluating WikiText2 perplexity...")
-    ppl = k2quant.evaluate_perplexity(
+    ppl = evaluate_perplexity(
         model, tokenizer,
         seqlen=EVAL_SEQLEN,
         device=DEVICE,
