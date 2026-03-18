@@ -1,13 +1,16 @@
-"""Test harness: compare QuantizableMoEBlock forward vs HF original.
+"""Test harness: compare QuantizableExperts dispatch vs HF original.
 
-Measures per-layer output divergence to determine if our reimplemented
-forward path introduces floating-point differences that compound across
-layers during calibration.
+Measures per-layer output divergence to verify that our experts-only
+replacement produces identical results to HF's experts.forward().
+
+Since we now only replace the experts sub-module (not the full MoE block),
+routing and shared expert remain HF's original code. This test verifies
+that the expert dispatch loop itself is bit-identical.
 
 Three tests:
-  1. Single-layer forward parity (output comparison)
-  2. Routing parity (logits, softmax, top-k indices/weights)
-  3. Accumulated divergence across all layers
+  1. Single-layer experts dispatch parity
+  2. Routing parity (should be trivially identical — we don't touch routing)
+  3. Accumulated divergence across all layers (experts-only swap)
 
 Usage:
     python tests/test_forward_parity.py
@@ -15,7 +18,6 @@ Usage:
 
 import os
 import sys
-import copy
 
 os.environ["OMP_NUM_THREADS"] = "1"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -24,9 +26,9 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-from k2quant.models.qwen_moe import QwenMoEBlock
+from k2quant.models.qwen_moe import QwenExperts
 
-# ── Configuration ────────────────────────────────────────────────────────
+# -- Configuration --
 MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B"
 DEVICE = "cuda"
 CACHE_DIR = "/workspace/kbvq/hf_cache"
@@ -57,18 +59,19 @@ def fmt(s: dict) -> str:
     )
 
 
-# ── Test 1: Single-layer forward parity ──────────────────────────────────
+# -- Test 1: Single-layer experts dispatch parity --
 
 def test_single_layer(model, layer_idx=0):
     print(f"\n{'='*70}")
-    print(f"Test 1: Single-layer forward parity (layer {layer_idx})")
+    print(f"Test 1: Single-layer MoE parity (layer {layer_idx})")
     print(f"{'='*70}")
 
     hf_mlp = model.model.layers[layer_idx].mlp
 
-    # Create our block from the same HF module
-    hf_params = next(hf_mlp.parameters())
-    qmoe = QwenMoEBlock.from_hf_module(
+    # Swap only experts, keep HF routing and shared expert
+    hf_experts_orig = hf_mlp.experts
+    hf_params = next(hf_experts_orig.parameters())
+    qe = QwenExperts.from_hf_module(
         hf_mlp, device=hf_params.device, dtype=hf_params.dtype
     )
 
@@ -77,80 +80,62 @@ def test_single_layer(model, layer_idx=0):
                      device=DEVICE, dtype=torch.float16)
 
     with torch.no_grad():
+        # Pass A: original HF forward
         hf_out = hf_mlp(x)
         if isinstance(hf_out, tuple):
             hf_out = hf_out[0]
 
-        our_out = qmoe(x)
+        # Pass B: swap experts, run same MoE block
+        hf_mlp.experts = qe
+        our_out = hf_mlp(x)
+        if isinstance(our_out, tuple):
+            our_out = our_out[0]
+
+        # Restore original
+        hf_mlp.experts = hf_experts_orig
 
     s = stats(hf_out, our_out)
     print(f"  Output: {fmt(s)}")
     return s
 
 
-# ── Test 2: Routing parity ───────────────────────────────────────────────
+# -- Test 2: Routing parity (trivial — we don't touch routing) --
 
 def test_routing(model, layer_idx=0):
     print(f"\n{'='*70}")
-    print(f"Test 2: Routing parity (layer {layer_idx})")
+    print(f"Test 2: Routing parity (layer {layer_idx}) — should be bit-identical")
     print(f"{'='*70}")
 
     hf_mlp = model.model.layers[layer_idx].mlp
-    hf_params = next(hf_mlp.parameters())
-    qmoe = QwenMoEBlock.from_hf_module(
-        hf_mlp, device=hf_params.device, dtype=hf_params.dtype
-    )
 
     x = torch.randn(1, SEQ_LEN, model.config.hidden_size,
                      device=DEVICE, dtype=torch.float16)
     x_flat = x.reshape(-1, model.config.hidden_size)
 
     with torch.no_grad():
-        # HF routing path: gate is a custom module
+        # HF routing
         hf_logits, hf_scores, hf_indices = hf_mlp.gate(x_flat)
 
-        # Our routing path
-        our_logits = F.linear(x_flat, qmoe.router)
-        our_softmax = F.softmax(our_logits, dim=-1, dtype=torch.float)
-        our_scores, our_indices = torch.topk(our_softmax, k=qmoe.top_k, dim=-1)
-        our_scores = our_scores.to(our_softmax.dtype)
-
-    # Router logits (pre-softmax)
-    s_logits = stats(hf_logits, our_logits)
-    print(f"  Logits (pre-softmax): {fmt(s_logits)}")
-
-    # Softmax outputs — HF gate returns post-softmax as first element
-    s_softmax = stats(hf_logits, our_softmax)
-    print(f"  Softmax outputs:      {fmt(s_softmax)}")
-
-    # Top-k indices match?
-    # Sort within each token's top-k to ignore ordering
-    hf_sorted = hf_indices.sort(dim=-1).values
-    our_sorted = our_indices.sort(dim=-1).values
-    idx_match = (hf_sorted == our_sorted).all().item()
-    idx_match_pct = (hf_sorted == our_sorted).float().mean().item() * 100
-    print(f"  Top-k indices match:  {idx_match} ({idx_match_pct:.1f}%)")
-
-    # Top-k weights
-    s_weights = stats(hf_scores, our_scores)
-    print(f"  Top-k weights:        {fmt(s_weights)}")
+    print(f"  Routing is HF's original code — no comparison needed.")
+    print(f"  Gate output shape: logits={hf_logits.shape}, "
+          f"scores={hf_scores.shape}, indices={hf_indices.shape}")
 
 
-# ── Test 3: Accumulated divergence ───────────────────────────────────────
+# -- Test 3: Accumulated divergence across all layers --
 
 def test_accumulated(model):
     print(f"\n{'='*70}")
-    print(f"Test 3: Accumulated divergence across layers")
+    print(f"Test 3: Accumulated divergence across layers (experts-only swap)")
     print(f"{'='*70}")
 
     num_layers = model.config.num_hidden_layers
 
-    # Random input tokens (use fixed seed for reproducibility)
+    # Random input tokens
     torch.manual_seed(42)
     input_ids = torch.randint(0, model.config.vocab_size, (1, SEQ_LEN),
                               device=DEVICE)
 
-    # ── Pass A: Original HF model, record MoE block inputs ──
+    # -- Pass A: Original HF model, record MoE block inputs --
     print("  Pass A: Recording MoE inputs with original HF forward...")
     hf_inputs = {}
     hooks = []
@@ -176,20 +161,21 @@ def test_accumulated(model):
     for h in hooks:
         h.remove()
 
-    # ── Swap all MoE blocks ──
-    print("  Swapping all MoE blocks to QwenMoEBlock...")
-    original_mlps = {}
+    # -- Swap all experts sub-modules --
+    print("  Swapping all experts to QwenExperts...")
+    original_experts = {}
     for li in range(num_layers):
         hf_mlp = model.model.layers[li].mlp
-        original_mlps[li] = hf_mlp
-        hf_params = next(hf_mlp.parameters())
-        qmoe = QwenMoEBlock.from_hf_module(
+        hf_experts = hf_mlp.experts
+        original_experts[li] = hf_experts
+        hf_params = next(hf_experts.parameters())
+        qe = QwenExperts.from_hf_module(
             hf_mlp, device=hf_params.device, dtype=hf_params.dtype
         )
-        model.model.layers[li].mlp = qmoe
+        hf_mlp.experts = qe
 
-    # ── Pass B: Our blocks, record MoE block inputs ──
-    print("  Pass B: Recording MoE inputs with our QwenMoEBlock forward...")
+    # -- Pass B: Our experts, record MoE block inputs --
+    print("  Pass B: Recording MoE inputs with QwenExperts dispatch...")
     our_inputs = {}
     hooks = []
 
@@ -214,11 +200,11 @@ def test_accumulated(model):
     for h in hooks:
         h.remove()
 
-    # ── Restore original modules ──
+    # -- Restore original experts --
     for li in range(num_layers):
-        model.model.layers[li].mlp = original_mlps[li]
+        model.model.layers[li].mlp.experts = original_experts[li]
 
-    # ── Compare ──
+    # -- Compare --
     print(f"\n  {'Layer':<8} {'Max Abs':>12} {'Mean Abs':>12} {'Max Rel':>12} {'Cosine':>16}")
     print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*16}")
 
@@ -232,7 +218,7 @@ def test_accumulated(model):
         )
 
 
-# ── Main ─────────────────────────────────────────────────────────────────
+# -- Main --
 
 def main():
     print("Loading model...")

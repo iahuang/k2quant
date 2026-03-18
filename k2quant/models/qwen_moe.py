@@ -1,12 +1,11 @@
-"""QwenMoEBlock: QuantizableMoEBlock for Qwen1.5-MoE models.
+"""QwenExperts: QuantizableExperts for Qwen1.5-MoE models.
 
-The only model-specific code is from_hf_module(), which knows how to
-extract weights from Qwen's HuggingFace MoE implementation:
-    - experts.gate_up_proj → gate_up_proj (already fused)
-    - experts.down_proj → down_proj
-    - gate.weight → router
-    - shared_expert → shared_expert (preserved, not quantized)
-    - shared_expert_gate → shared_expert_gate (preserved)
+The only model-specific code is from_hf_module() and get_routing_info(),
+which know how to extract weights and routing from Qwen's HF MoE block:
+    - experts.gate_up_proj -> gate_up_proj (already fused)
+    - experts.down_proj -> down_proj
+    - gate.weight -> router (for down_proj calibration routing)
+    - gate.top_k -> top_k
 """
 
 from __future__ import annotations
@@ -15,53 +14,48 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..moe_block import QuantizableMoEBlock
+from ..moe_block import QuantizableExperts
 
 
-class QwenMoEBlock(QuantizableMoEBlock):
-    """QuantizableMoEBlock for Qwen1.5-MoE-A2.7B and similar architectures."""
+class QwenExperts(QuantizableExperts):
+    """QuantizableExperts for Qwen1.5-MoE-A2.7B and similar architectures."""
 
     @classmethod
     def from_hf_module(
         cls,
-        hf_moe: nn.Module,
+        hf_moe_block: nn.Module,
         *,
         device: Optional[torch.device | str] = None,
         dtype: Optional[torch.dtype] = None,
-    ) -> QwenMoEBlock:
-        """Convert a Qwen HF MoE module to a QwenMoEBlock.
+    ) -> QwenExperts:
+        """Convert a Qwen HF MoE block's experts to QwenExperts.
 
         Expected HF module structure:
-            hf_moe.experts.num_experts: int
-            hf_moe.gate.weight: (num_experts, hidden_size)
-            hf_moe.gate.top_k: int
-            hf_moe.experts.gate_up_proj: (num_experts, 2*inter, hidden)
-            hf_moe.experts.down_proj: (num_experts, hidden, inter)
-            hf_moe.experts.act_fn: activation function
-            hf_moe.shared_expert: Qwen2MoeMLP (optional, always-on expert)
-            hf_moe.shared_expert_gate: Linear(hidden, 1) (optional, sigmoid gate)
-            hf_moe.norm_topk_prob: bool
+            hf_moe_block.experts.num_experts: int
+            hf_moe_block.experts.gate_up_proj: (num_experts, 2*inter, hidden)
+            hf_moe_block.experts.down_proj: (num_experts, hidden, inter)
+            hf_moe_block.experts.act_fn: activation function
+            hf_moe_block.gate.weight: (num_experts, hidden_size)
         """
+        experts = hf_moe_block.experts
         block = cls(
-            num_experts=hf_moe.experts.num_experts,
-            hidden_size=hf_moe.gate.weight.shape[1],
-            intermediate_size=hf_moe.experts.down_proj.shape[2],
-            top_k=hf_moe.gate.top_k,
-            act_fn=hf_moe.experts.act_fn,
-            norm_topk_prob=getattr(hf_moe, "norm_topk_prob", False),
+            num_experts=experts.num_experts,
+            hidden_size=hf_moe_block.gate.weight.shape[1],
+            intermediate_size=experts.down_proj.shape[2],
+            act_fn=experts.act_fn,
             device=device,
             dtype=dtype,
         )
-        block.gate_up_proj.data.copy_(hf_moe.experts.gate_up_proj.data)
-        block.down_proj.data.copy_(hf_moe.experts.down_proj.data)
-        block.router.data.copy_(hf_moe.gate.weight.data)
-
-        # Preserve shared expert (not quantized — kept at full precision)
-        if hasattr(hf_moe, "shared_expert") and hf_moe.shared_expert is not None:
-            block.shared_expert = hf_moe.shared_expert
-        if hasattr(hf_moe, "shared_expert_gate") and hf_moe.shared_expert_gate is not None:
-            block.shared_expert_gate = hf_moe.shared_expert_gate
+        block.gate_up_proj.data.copy_(experts.gate_up_proj.data)
+        block.down_proj.data.copy_(experts.down_proj.data)
 
         return block
+
+    @staticmethod
+    def get_routing_info(
+        hf_moe_block: nn.Module,
+    ) -> tuple[torch.Tensor, int]:
+        """Return (router_weight, top_k) from Qwen's gate module."""
+        gate = hf_moe_block.gate
+        return gate.weight, gate.top_k

@@ -2,7 +2,7 @@ from .quant import w_quantize, w_quantize_and_reconstruct
 from .core import QuantConfig, bcos
 from .projection import quantize_projection, BCOSLayout, ProjectionResult
 from .pipeline import quantize_model
-from .moe_block import QuantizableMoEBlock
+from .moe_block import QuantizableExperts
 
 __all__ = [
     # Layer 1: math primitives
@@ -16,5 +16,5 @@ __all__ = [
     "ProjectionResult",
     # Layer 3: full model pipeline
     "quantize_model",
-    "QuantizableMoEBlock",
+    "QuantizableExperts",
 ]

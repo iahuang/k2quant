@@ -3,7 +3,7 @@
 End-to-end example that quantizes all MoE expert layers using the
 IDRE + VPTQ + BCOS pipeline, then evaluates WikiText2 perplexity.
 
-Result: PPL ≈ 7.56 at 2-bit (vs 6.71 FP16 baseline).
+Result: PPL ~ 7.56 at 2-bit (vs 6.71 FP16 baseline).
 """
 
 import os
@@ -17,10 +17,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import k2quant
-from k2quant.models.qwen_moe import QwenMoEBlock
+from k2quant.models.qwen_moe import QwenExperts
 from k2quant.util import get_calibration_data, evaluate_perplexity
 
-# ── Configuration ────────────────────────────────────────────────────────
+# -- Configuration --
 MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B"
 DEVICE = "cuda"
 CACHE_DIR = "/workspace/kbvq/hf_cache"
@@ -74,8 +74,8 @@ def main():
 
     k2quant.quantize_model(
         model, calib_data, cfg,
-        QwenMoEBlock,
-        get_moe_parent_and_attr=lambda m, i: (m.model.layers[i], "mlp"),
+        QwenExperts,
+        get_moe_block=lambda m, i: m.model.layers[i].mlp,
         num_layers=model.config.num_hidden_layers,
         device=DEVICE, max_calib_tokens=4096, batch_size=2,
     )
