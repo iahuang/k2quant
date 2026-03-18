@@ -47,6 +47,9 @@ class QuantizableMoEBlock(nn.Module):
         intermediate_size: int,
         top_k: int,
         act_fn: Callable = F.silu,
+        *,
+        device: Optional[torch.device | str] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -57,13 +60,16 @@ class QuantizableMoEBlock(nn.Module):
 
         # Expert weights — standardized layout
         self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * intermediate_size, hidden_size)
+            torch.empty(num_experts, 2 * intermediate_size, hidden_size,
+                        device=device, dtype=dtype)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size)
+            torch.empty(num_experts, hidden_size, intermediate_size,
+                        device=device, dtype=dtype)
         )
         self.router = nn.Parameter(
-            torch.empty(num_experts, hidden_size)
+            torch.empty(num_experts, hidden_size,
+                        device=device, dtype=dtype)
         )
 
         # BCOS correction params — None until quantization sets them.
@@ -269,7 +275,13 @@ class QuantizableMoEBlock(nn.Module):
         return X_down
 
     @classmethod
-    def from_hf_module(cls, hf_module: nn.Module) -> QuantizableMoEBlock:
+    def from_hf_module(
+        cls,
+        hf_module: nn.Module,
+        *,
+        device: Optional[torch.device | str] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> QuantizableMoEBlock:
         """Create a QuantizableMoEBlock by copying weights from an HF module.
 
         Subclasses must override this to handle architecture-specific
@@ -277,6 +289,10 @@ class QuantizableMoEBlock(nn.Module):
 
         Args:
             hf_module: The HuggingFace MoE module to convert.
+            device: Target device for the new block's parameters.
+                When provided, tensors are allocated directly on this device,
+                avoiding a costly CPU→device transfer after construction.
+            dtype: Target dtype for the new block's parameters.
 
         Returns:
             A new QuantizableMoEBlock with weights copied from hf_module.

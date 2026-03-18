@@ -26,22 +26,20 @@ def _swap_moe_blocks(
     num_layers: int,
 ) -> list[tuple[str, QuantizableMoEBlock]]:
     """Replace HF MoE modules with QuantizableMoEBlocks, return the new blocks."""
+    parent_names = {id(m): n for n, m in model.named_modules()}
     blocks = []
     for li in range(num_layers):
         parent, attr = get_moe_parent_and_attr(model, li)
         hf_moe = getattr(parent, attr)
-        qmoe = block_cls.from_hf_module(hf_moe)
-        device = next(hf_moe.parameters()).device
-        qmoe = qmoe.to(device=device, dtype=next(hf_moe.parameters()).dtype)
+        hf_params = next(hf_moe.parameters())
+        qmoe = block_cls.from_hf_module(
+            hf_moe, device=hf_params.device, dtype=hf_params.dtype
+        )
         setattr(parent, attr, qmoe)
-        # Record the full module path for logging
-        name = f"{attr}.{li}"
-        for n, m in model.named_modules():
-            if m is qmoe:
-                name = n
-                break
+        parent_name = parent_names.get(id(parent), "")
+        name = f"{parent_name}.{attr}" if parent_name else attr
         blocks.append((name, qmoe))
-        print(f"   {li} Swapped {name} with {qmoe}")
+        print(f"   {li} Swapped {name}")
         del hf_moe
     gc.collect()
     torch.cuda.empty_cache()
