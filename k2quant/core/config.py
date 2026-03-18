@@ -45,8 +45,6 @@ class QuantConfig:
     vq_kmeans_niter: int = 20
     vptq_block_size: int = 128
     vptq_damp_percent: float = 0.01
-    vptq_enable_residual: bool = False
-    vptq_res_k: int = 16
     vq_num_threads: int = 24
     seed: int = 42
 

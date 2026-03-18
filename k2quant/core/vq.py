@@ -2,7 +2,8 @@
 Vector Quantization (VQ) modeled after VPTQ (Liu et al., 2024) and GPTVQ (van Baalen et al., 2024).
 
 Hessian-weighted k-means initialization + GPTQ-style column-by-column
-error propagation.
+error propagation. Operates on per-expert weight matrices independently,
+parallelized across experts via ThreadPoolExecutor.
 
 Important notes:
 
@@ -18,6 +19,9 @@ Important notes:
     diag(H_inv)), so their errors propagate to less important columns. This contribution
     is unique to this implementation, but it empirically provides a significant improvement in
     perplexity.
+
+-   Residual VQ: This part is intentionally omitted for simplicity. Empirical testing found that it
+    provides little to no benefit in the context of KBVQ-MoE.
 """
 
 from __future__ import annotations
@@ -25,15 +29,12 @@ from __future__ import annotations
 import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 
+import faiss
 import numpy as np
 import torch
 import torch.nn as nn
 
 from .config import QuantConfig
-
-# Max training vectors per expert for k-means. K=256 centroids in d=4
-# space converge well with 16-32K samples. More is wasteful.
-_KMEANS_MAX_TRAIN = 32_768
 
 
 @dataclasses.dataclass
@@ -71,136 +72,65 @@ class VQResult:
     Apply as W_recon[:, :, col_invperm]."""
 
 
-# ── Weighted k-means in PyTorch ───────────────────────────────────────────
+def _vptq_one_expert_col(args: tuple) -> tuple:
+    """VPTQ quantization for a single expert, col-axis mode (GPTVQ-style).
 
-
-def _batched_weighted_kmeans(
-    data: torch.Tensor,
-    weights: torch.Tensor,
-    K: int,
-    niter: int,
-    seed: int = 0,
-    max_batch: int = 16,
-) -> torch.Tensor:
-    """Batched weighted k-means — runs B independent k-means in parallel.
-
-    Processes experts in chunks of max_batch to limit GPU memory.
-    The main memory cost per chunk is the (batch, N, K) distance tensor.
+    Subvectors span d contiguous input columns for each output row.
+    The centroid assignment is atomic over d columns — all d values are
+    committed by one lookup. Intra-group scalar error propagation then
+    updates the remaining workspace, but cannot revisit the centroid
+    choice for columns j+1..j+d-1 within the group.
 
     Args:
-        data: Training vectors. Shape: (B, N, d). float32.
-        weights: Per-vector weights. Shape: (B, N). float32.
-        K: Number of centroids per batch element.
-        niter: Number of iterations.
-        seed: Random seed.
-        max_batch: Max experts to process in one GPU batch.
+        args: Tuple of (W_np, Hinv_np, h_diag_np, d, K, niter,
+              block_size).
 
     Returns:
-        centroids: Shape: (B, K, d). float32. Same device as data.
+        Tuple of (indices, centroids).
     """
-    B = data.shape[0]
-    if B <= max_batch:
-        return _batched_weighted_kmeans_core(data, weights, K, niter, seed)
-
-    chunks = []
-    for start in range(0, B, max_batch):
-        end = min(start + max_batch, B)
-        chunk = _batched_weighted_kmeans_core(
-            data[start:end], weights[start:end], K, niter, seed + start
-        )
-        chunks.append(chunk)
-    return torch.cat(chunks, dim=0)
-
-
-def _batched_weighted_kmeans_core(
-    data: torch.Tensor,
-    weights: torch.Tensor,
-    K: int,
-    niter: int,
-    seed: int,
-) -> torch.Tensor:
-    """Core batched weighted k-means for a single chunk of experts."""
-    B, N, d = data.shape
-
-    # Initialize centroids via weighted random sampling, per batch element
-    gen = torch.Generator(device=data.device).manual_seed(seed)
-    probs = weights / weights.sum(dim=1, keepdim=True)  # (B, N)
-    all_centroids = []
-    for b in range(B):
-        init_idx = torch.multinomial(probs[b], K, replacement=False, generator=gen)
-        all_centroids.append(data[b, init_idx])
-    centroids = torch.stack(all_centroids)  # (B, K, d)
-
-    for _ in range(niter):
-        # Assignment via decomposed L2: ||x-c||^2 = ||x||^2 - 2*x@c^T + ||c||^2
-        # This avoids materializing (B, N, K, d) intermediates.
-        x_sq = (data * data).sum(dim=2, keepdim=True)  # (B, N, 1)
-        c_sq = (centroids * centroids).sum(dim=2, keepdim=True)  # (B, K, 1)
-        # (B, N, d) @ (B, d, K) -> (B, N, K)
-        dot = torch.bmm(data, centroids.transpose(1, 2))
-        dists = x_sq - 2 * dot + c_sq.transpose(1, 2)  # (B, N, K)
-        assignments = dists.argmin(dim=2)  # (B, N)
-        del dists, dot, x_sq, c_sq
-
-        # Update: weighted mean per cluster
-        one_hot = torch.zeros(B, N, K, device=data.device, dtype=data.dtype)
-        one_hot.scatter_(2, assignments.unsqueeze(2), 1.0)
-        weighted_one_hot = one_hot * weights.unsqueeze(2)  # (B, N, K)
-        del one_hot
-
-        cluster_weights = weighted_one_hot.sum(dim=1)  # (B, K)
-        # (B, K, N) @ (B, N, d) -> (B, K, d)
-        new_centroids = torch.bmm(weighted_one_hot.transpose(1, 2), data)
-        del weighted_one_hot
-
-        nonempty = cluster_weights > 0  # (B, K)
-        divisor = cluster_weights.unsqueeze(2).clamp(min=1e-10)
-        new_centroids = new_centroids / divisor
-        new_centroids = torch.where(
-            nonempty.unsqueeze(2), new_centroids, centroids
-        )
-        centroids = new_centroids
-
-    return centroids
-
-
-# ── GPTQ error propagation (per-expert, CPU) ─────────────────────────────
-
-
-def _gptq_with_codebook(
-    W_np: np.ndarray,
-    Hinv_np: np.ndarray,
-    centroids_np: np.ndarray,
-    d: int,
-    block_size: int,
-) -> np.ndarray:
-    """GPTQ-style quantization using a pre-trained codebook.
-
-    Sequentially assigns subvectors to nearest centroids while propagating
-    quantization error through the Hessian inverse. This is inherently
-    sequential per expert (error from column j affects column j+1).
-
-    Args:
-        W_np: Weight matrix for one expert. Shape: (oc, ic_padded). float64.
-        Hinv_np: Upper Cholesky of H^{-1}. Shape: (ic_padded, ic_padded). float64.
-        centroids_np: Codebook centroids. Shape: (K, d). float32.
-        d: Subvector dimension.
-        block_size: GPTQ block size.
-
-    Returns:
-        indices: Codebook assignments. Shape: (oc, n_subvecs). int32.
-    """
-    oc, ic = W_np.shape
+    W_np, Hinv_np, h_diag_np, d, K, niter, block_size = args
+    oc, ic = W_np.shape  # single expert: (oc, ic_padded)
     n_subvecs = ic // d
 
-    W = W_np.copy()  # already float64
-    indices = np.zeros((oc, n_subvecs), dtype=np.int32)
-    Hinv = Hinv_np  # already float64
-    centroids_f64 = centroids_np.astype(np.float64)
+    # ── 1. Hessian-weighted k-means ──────────────────────────────────────
+    # NOTE: The paper describes true weighted k-means where each training
+    # vector receives a Hessian-derived scalar weight in the loss function.
+    # This is approximated via oversampling: subvector positions spanning
+    # higher diag(H) columns contribute more training vectors to the
+    # codebook. This avoids modifying faiss's optimized k-means
+    # implementation. The approximation biases centroid placement toward
+    # important regions but does not minimize the exact weighted objective.
+    #
+    # Compute per-subvector importance from Hessian diagonal.
+    # Cap at 4x to prevent a single subvector from dominating training.
+    # This cap is not in the paper — chosen empirically.
+    subvec_weights = h_diag_np.reshape(n_subvecs, d).mean(axis=1)  # (n_subvecs,)
+    flat = W_np.reshape(oc, n_subvecs, d)  # (oc, n_subvecs, d)
 
-    # Precompute ||c||^2 for fast L2: ||x-c||^2 = ||x||^2 - 2*x@c^T + ||c||^2
-    c_sq = (centroids_np * centroids_np).sum(axis=1)  # (K,)
-    cT = centroids_np.T.copy()  # (d, K) — contiguous for matmul
+    if subvec_weights.sum() > 0:
+        norm_w = subvec_weights / (subvec_weights.mean() + 1e-10)
+        repeat_counts = np.clip(np.round(norm_w).astype(int), 1, 4)
+    else:
+        repeat_counts = np.ones(n_subvecs, dtype=int)
+
+    train_parts = []
+    for sv in range(n_subvecs):
+        vecs = flat[:, sv, :]  # (oc, d)
+        for _ in range(repeat_counts[sv]):
+            train_parts.append(vecs)
+    train_data = np.vstack(train_parts).astype(np.float32)
+
+    km = faiss.Kmeans(d, K, niter=niter, verbose=False, gpu=False)
+    km.train(train_data)
+    centroids = km.centroids.copy().astype(np.float32)  # (K, d)
+
+    search_index = faiss.IndexFlatL2(d)
+    search_index.add(centroids)
+
+    # ── 2. GPTQ-style error propagation ──────────────────────────────────
+    W = W_np.copy().astype(np.float64)
+    indices = np.zeros((oc, n_subvecs), dtype=np.int32)
+    Hinv = Hinv_np.astype(np.float64)
 
     for i1 in range(0, ic, block_size):
         i2 = min(i1 + block_size, ic)
@@ -210,35 +140,31 @@ def _gptq_with_codebook(
         Err1 = np.zeros_like(W1)
         Hinv1 = Hinv[i1:i2, i1:i2]  # (count, count)
 
+        # Process subvectors (groups of d columns) within this block
         for j in range(0, count - d + 1, d):
             sv = W1[:, j : j + d].astype(np.float32)  # (oc, d)
-
-            # Fast L2 nearest centroid: matmul decomposition
-            # sv @ cT -> (oc, K), avoids (oc, K, d) broadcast
-            dists = (sv * sv).sum(axis=1, keepdims=True) - 2.0 * (sv @ cT) + c_sq
-            idx = dists.argmin(axis=1).astype(np.int32)  # (oc,)
+            _, idx = search_index.search(sv, 1)  # (oc, 1)
+            idx = idx.reshape(-1)  # (oc,)
 
             sv_idx = (i1 + j) // d
             indices[:, sv_idx] = idx
-            q_sv = centroids_f64[idx]  # (oc, d)
+            q_sv = centroids[idx].astype(np.float64)  # (oc, d)
 
+            # Propagate errors column by column within subvector
             for c in range(d):
                 col = j + c
-                err = (W1[:, col] - q_sv[:, c]) / Hinv1[col, col]
+                err = (W1[:, col] - q_sv[:, c]) / Hinv1[col, col]  # (oc,)
                 Err1[:, col] = err
                 if col + 1 < count:
                     W1[:, col + 1 :] -= (
-                        err[:, np.newaxis]
-                        * Hinv1[col, col + 1 : count][np.newaxis, :]
+                        err[:, np.newaxis] * Hinv1[col, col + 1 : count][np.newaxis, :]
                     )
 
+        # Inter-block error propagation
         if i2 < ic:
             W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
 
-    return indices
-
-
-# ── Main entry point ──────────────────────────────────────────────────────
+    return indices, centroids
 
 
 def vq_quantize(
@@ -251,11 +177,8 @@ def vq_quantize(
 
     Hessian-weighted k-means + GPTQ error propagation + column ordering.
 
-    Two-phase approach:
-    1. K-means codebook training: batched across experts on GPU with
-       true weighted k-means (no oversampling approximation). Training
-       uses a weighted subsample of subvectors (up to 32K per expert).
-    2. GPTQ error propagation: per-expert on CPU (inherently sequential).
+    Quantizes a batch of expert weight matrices with output-aware error
+    minimization. Each expert is processed independently in a thread pool.
 
     Args:
         W_quant: Weight residuals after IDRE.
@@ -265,13 +188,14 @@ def vq_quantize(
         cfg: Quantization configuration (QuantConfig).
 
     Returns:
-        VQResult with all indices, codebooks, and column permutation info.
+        VPTQResult with all indices, codebooks, and column permutation info.
     """
     n, oc, ic = W_quant.shape
     K = cfg.codebook_size
     d = cfg.vq_d
 
     # ── Padding ───────────────────────────────────────────────────────────
+    # Pad ic to be divisible by d
     ic_pad = (d - ic % d) % d
     oc_pad = 0
     if ic_pad > 0:
@@ -288,74 +212,59 @@ def vq_quantize(
         H = H_padded
 
     # ── Compute upper Cholesky of H^{-1} (shared across all experts) ────
+    # Damping prevents singularity when some input features have zero variance.
     ic_h = ic_padded
     damp = cfg.vptq_damp_percent * H.diagonal().mean()
     H_damp = H + damp * torch.eye(ic_h, device=H.device, dtype=H.dtype)
-    H_inv = torch.linalg.inv(H_damp.double()).float()
-    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()
+    H_inv = torch.linalg.inv(H_damp.double()).float()  # (ic_h, ic_h)
+    # Upper Cholesky factorization for numerical stability in GPTQ loop.
+    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()  # (ic_h, ic_h)
 
     # ── Column ordering ──────────────────────────────────────────────────
-    col_perm = torch.argsort(Hinv.diagonal())
-    col_invperm = torch.argsort(col_perm)
+    # Sort columns by ascending diag(H_inv): process easy/low-sensitivity
+    # columns first. Their quantization errors propagate to columns that
+    # are less affected by perturbation, while high-sensitivity columns
+    # are quantized last with the benefit of all prior error corrections.
+    col_perm = torch.argsort(Hinv.diagonal())  # (ic_h,)
+    col_invperm = torch.argsort(col_perm)  # (ic_h,)
     Hinv = Hinv[col_perm][:, col_perm]
     W_quant = W_quant[:, :, col_perm]
-    h_diag = H.diagonal()[col_perm]  # (ic_h,)
+    h_diag_np = H.diagonal()[col_perm].cpu().float().numpy()  # (ic_h,)
 
-    # ── Phase 1: Batched weighted k-means (GPU) ──────────────────────────
-    n_subvecs = ic_padded // d
+    Hinv_np = Hinv.cpu().numpy()
 
-    # Per-subvector Hessian weights
-    subvec_weights = h_diag.reshape(n_subvecs, d).mean(dim=1)  # (n_subvecs,)
-    subvec_weights = subvec_weights.clamp(min=0)
-
-    # Reshape into subvectors: (n, oc, n_subvecs, d)
-    flat = W_quant.reshape(n, oc, n_subvecs, d)
-
-    # Total subvectors per expert: oc * n_subvecs. Subsample if too large.
-    N_total = oc * n_subvecs
-    if N_total <= _KMEANS_MAX_TRAIN:
-        # Use all subvectors
-        train_data = flat.reshape(n, N_total, d)
-        per_vec_weights = subvec_weights.repeat(oc)  # (N_total,)
-        per_vec_weights = per_vec_weights.unsqueeze(0).expand(n, -1)
-    else:
-        # Weighted subsample: sample rows proportional to uniform,
-        # but preserve subvec weight structure.
-        # Sample a subset of oc rows, use all n_subvecs positions per row.
-        max_rows = _KMEANS_MAX_TRAIN // n_subvecs
-        gen = torch.Generator(device=W_quant.device).manual_seed(cfg.seed)
-        row_idx = torch.randint(oc, (n, max_rows), generator=gen)  # (n, max_rows)
-        # Gather: (n, max_rows, n_subvecs, d)
-        train_data = torch.gather(
-            flat,
-            1,
-            row_idx.unsqueeze(2).unsqueeze(3).expand(-1, -1, n_subvecs, d),
-        ).reshape(n, max_rows * n_subvecs, d)
-        per_vec_weights = subvec_weights.repeat(max_rows)
-        per_vec_weights = per_vec_weights.unsqueeze(0).expand(n, -1)
-
-    all_centroids = _batched_weighted_kmeans(
-        train_data, per_vec_weights, K, cfg.vq_kmeans_niter, seed=cfg.seed
-    )  # (n, K, d)
-
-    # ── Phase 2: GPTQ error propagation (CPU, parallel across experts) ───
-    Hinv_np = Hinv.cpu().numpy().astype(np.float64)
-    centroids_cpu = all_centroids.cpu().float().numpy()
+    # ── Dispatch per-expert VPTQ to thread pool ──────────────────────────
+    worker_fn = _vptq_one_expert_col
 
     work_items = []
     for ei in range(n):
-        W_np = W_quant[ei].cpu().float().numpy().astype(np.float64)
-        work_items.append((W_np, Hinv_np, centroids_cpu[ei], d, cfg.vptq_block_size))
+        W_np = W_quant[ei].cpu().float().numpy()
+        work_items.append(
+            (
+                W_np,
+                Hinv_np,
+                h_diag_np,
+                d,
+                K,
+                cfg.vq_kmeans_niter,
+                cfg.vptq_block_size,
+            )
+        )
 
     with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
-        results = list(pool.map(lambda args: _gptq_with_codebook(*args), work_items))
+        results = list(pool.map(worker_fn, work_items))
 
     # ── Collect results ──────────────────────────────────────────────────
-    all_indices = [torch.from_numpy(idx) for idx in results]
+    all_indices = []
+    all_codebooks = []
+
+    for idx, cb in results:
+        all_indices.append(torch.from_numpy(idx))
+        all_codebooks.append(torch.from_numpy(cb).half())
 
     return VQResult(
         main_indices=torch.stack(all_indices),
-        main_codebooks=all_centroids.half().cpu(),
+        main_codebooks=torch.stack(all_codebooks),
         oc_pad=oc_pad,
         oc_padded=oc_padded,
         ic_pad=ic_pad,
@@ -373,11 +282,12 @@ def vq_reconstruct(
     """
     Reconstruct weight matrices from VQ quantization results.
 
-    Looks up each subvector's centroid from the codebook, undoes column
-    permutation, and strips padding.
+    Looks up each subvector's centroid from the codebook, optionally adds
+    the residual codebook contribution, undoes column permutation, and
+    strips padding.
 
     Args:
-        result: VQResult from vq_quantize().
+        result: VPTQResult from vptq_quantize().
         n_experts: Number of experts.
         oc: Output channels (rows per expert, before padding).
         ic: Input channels (columns per expert, before padding).
@@ -386,6 +296,7 @@ def vq_reconstruct(
         W_recon: Reconstructed weights.
             Shape: (n_experts, oc, ic). float16.
     """
+
     return _reconstruct_col(result, n_experts, oc, ic)
 
 
