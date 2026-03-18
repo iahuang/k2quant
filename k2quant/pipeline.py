@@ -1,8 +1,9 @@
 """High-level quantization pipeline for MoE models.
 
-Provides quantize_model() as the single entry point: collects calibration
-activations on the original HF model, swaps HF MoE modules for
-QuantizableMoEBlocks, and quantizes all expert projections with BCOS.
+Provides quantize_model() as the single entry point: swaps HF MoE
+modules for QuantizableMoEBlocks, collects calibration activations
+through the swapped forward (matching inference behavior), and
+quantizes all expert projections with BCOS.
 """
 
 from __future__ import annotations
@@ -17,54 +18,6 @@ import torch.nn as nn
 from .core import QuantConfig
 from .moe_block import QuantizableMoEBlock
 from .projection import quantize_projection
-
-
-def _collect_activations_via_hooks(
-    model: nn.Module,
-    get_moe_parent_and_attr: Callable[[nn.Module, int], tuple[nn.Module, str]],
-    num_layers: int,
-    calib_data: torch.Tensor,
-    device: str,
-    batch_size: int,
-    log_fn: Callable[[str], None],
-) -> dict[int, list[torch.Tensor]]:
-    """Collect MoE block inputs using hooks on the original HF modules.
-
-    Runs calibration forward passes through the untouched HF model so that
-    activations at each layer are bit-identical to what the original model
-    produces. This avoids compound divergence from our reimplemented forward.
-    """
-    layer_inputs: dict[int, list[torch.Tensor]] = {}
-    hooks = []
-
-    for li in range(num_layers):
-        parent, attr = get_moe_parent_and_attr(model, li)
-        hf_moe = getattr(parent, attr)
-        storage: list[torch.Tensor] = []
-        layer_inputs[li] = storage
-
-        def make_hook(s):
-            def fn(_module, args, _kwargs, output):
-                s.append(args[0].detach().cpu())
-                return output
-            return fn
-
-        h = hf_moe.register_forward_hook(make_hook(storage), with_kwargs=True)
-        hooks.append(h)
-
-    n_batches = len(calib_data) // batch_size
-    with torch.no_grad():
-        for i in range(0, len(calib_data), batch_size):
-            batch = calib_data[i : i + batch_size].to(device)
-            model(batch)
-            batch_idx = i // batch_size
-            if batch_idx % 32 == 0:
-                log_fn(f"    Batch {batch_idx + 1}/{n_batches}")
-
-    for h in hooks:
-        h.remove()
-
-    return layer_inputs
 
 
 def _swap_moe_blocks(
@@ -94,6 +47,35 @@ def _swap_moe_blocks(
     return blocks
 
 
+def _collect_activations(
+    model: nn.Module,
+    moe_blocks: list[tuple[str, QuantizableMoEBlock]],
+    calib_data: torch.Tensor,
+    device: str,
+    batch_size: int,
+    log_fn: Callable[[str], None],
+) -> dict[str, list[torch.Tensor]]:
+    """Enable collection on MoE blocks, run forward passes, harvest inputs.
+
+    Activations are collected through the swapped QuantizableMoEBlock forward
+    so that calibration matches the inference path — BCOS corrections are
+    optimized for the same numerical behavior used at evaluation time.
+    """
+    for _, block in moe_blocks:
+        block.start_collecting()
+
+    n_batches = len(calib_data) // batch_size
+    with torch.no_grad():
+        for i in range(0, len(calib_data), batch_size):
+            batch = calib_data[i : i + batch_size].to(device)
+            model(batch)
+            batch_idx = i // batch_size
+            if batch_idx % 32 == 0:
+                log_fn(f"    Batch {batch_idx + 1}/{n_batches}")
+
+    return {name: block.stop_collecting() for name, block in moe_blocks}
+
+
 def quantize_model(
     model: nn.Module,
     calib_data: torch.Tensor,
@@ -109,9 +91,9 @@ def quantize_model(
 ) -> None:
     """Quantize all MoE expert layers of a model in-place.
 
-    Collects calibration activations on the original HF model (ensuring
-    bit-identical activations), then swaps HF MoE modules for
-    QuantizableMoEBlocks and quantizes each block's projections with BCOS.
+    Swaps HF MoE modules for QuantizableMoEBlocks, collects calibration
+    activations through the swapped forward (so BCOS corrections match
+    inference behavior), then quantizes each block's projections.
 
     Args:
         model: The HuggingFace model to quantize (modified in-place).
@@ -130,21 +112,20 @@ def quantize_model(
     if log_fn is None:
         log_fn = print
 
-    # Step 1: Collect calibration activations on the original HF model
-    log_fn("  Collecting calibration activations (original HF forward)...")
-    layer_inputs = _collect_activations_via_hooks(
-        model, get_moe_parent_and_attr, num_layers,
-        calib_data, device, batch_size, log_fn,
-    )
-    log_fn("  Activations collected.")
-
-    # Step 2: Swap HF modules for quantizable blocks
+    # Step 1: Swap HF modules for quantizable blocks
     log_fn("  Swapping MoE blocks...")
     moe_blocks = _swap_moe_blocks(
         model, block_cls, get_moe_parent_and_attr, num_layers
     )
     num_blocks = len(moe_blocks)
     log_fn(f"  Swapped {num_blocks} MoE blocks.")
+
+    # Step 2: Collect calibration activations (through swapped forward)
+    log_fn("  Collecting calibration activations...")
+    block_inputs = _collect_activations(
+        model, moe_blocks, calib_data, device, batch_size, log_fn
+    )
+    log_fn("  Activations collected.")
 
     # Step 3: Quantize block by block
     log_fn("  Quantizing blocks...")
@@ -155,8 +136,8 @@ def quantize_model(
         hidden_size = block.hidden_size
 
         # Prepare activations: concatenate, reshape, subsample
-        acts = torch.cat(layer_inputs[bi], dim=0).reshape(-1, hidden_size)
-        del layer_inputs[bi]
+        acts = torch.cat(block_inputs[name], dim=0).reshape(-1, hidden_size)
+        del block_inputs[name]
         if acts.shape[0] > max_calib_tokens:
             perm = torch.randperm(
                 acts.shape[0], generator=torch.Generator().manual_seed(cfg.seed)
@@ -203,6 +184,6 @@ def quantize_model(
 
     log_fn(f"\n  Total quantization: {time.time() - t_start:.1f}s")
 
-    del layer_inputs
+    del block_inputs
     gc.collect()
     torch.cuda.empty_cache()
