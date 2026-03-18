@@ -152,13 +152,18 @@ class QuantizableMoEBlock(nn.Module):
         """MoE forward with optional BCOS correction.
 
         Args:
-            hidden_states: Input activations. (num_tokens, hidden_size).
+            hidden_states: Input activations.
+                (batch, seq_len, hidden_size) or (num_tokens, hidden_size).
 
         Returns:
-            Output activations. (num_tokens, hidden_size).
+            Output activations. Same shape as input.
         """
         if self._collecting:
             self._collected_inputs.append(hidden_states.detach().cpu())
+
+        # Flatten to 2D for dispatch, restore shape at end
+        input_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
 
         # Routing
         router_logits = F.linear(hidden_states, self.router)
@@ -217,7 +222,7 @@ class QuantizableMoEBlock(nn.Module):
                 0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
             )
 
-        return final_hidden_states
+        return final_hidden_states.reshape(input_shape)
 
     def compute_routed_calibration(
         self,
