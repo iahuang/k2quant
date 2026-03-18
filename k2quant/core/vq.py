@@ -70,59 +70,6 @@ class VQResult:
 # ── Weighted k-means in PyTorch ───────────────────────────────────────────
 
 
-def _weighted_kmeans(
-    data: torch.Tensor,
-    weights: torch.Tensor,
-    K: int,
-    niter: int,
-    seed: int = 0,
-) -> torch.Tensor:
-    """Hessian-weighted k-means on GPU or CPU.
-
-    Args:
-        data: Training vectors. Shape: (N, d). float32.
-        weights: Per-vector importance weight. Shape: (N,). float32.
-            Used in centroid update: c_k = sum(w_i * x_i) / sum(w_i)
-            for all x_i assigned to cluster k.
-        K: Number of centroids.
-        niter: Number of iterations.
-        seed: Random seed for initial centroid selection.
-
-    Returns:
-        centroids: Shape: (K, d). float32. Same device as data.
-    """
-    N, d = data.shape
-
-    # Initialize centroids via weighted random sampling (k-means++ is
-    # overkill for K=256, d=4 — random init converges in <10 iters).
-    gen = torch.Generator(device=data.device).manual_seed(seed)
-    probs = weights / weights.sum()
-    init_idx = torch.multinomial(probs, K, replacement=False, generator=gen)
-    centroids = data[init_idx].clone()  # (K, d)
-
-    for _ in range(niter):
-        # Assignment: find nearest centroid for each vector
-        # dists: (N, K) = ||x_i - c_k||^2
-        dists = torch.cdist(data, centroids, p=2.0).square()  # (N, K)
-        assignments = dists.argmin(dim=1)  # (N,)
-
-        # Update: weighted mean per cluster
-        # one_hot: (N, K), weights: (N,) -> weighted_one_hot: (N, K)
-        one_hot = torch.zeros(N, K, device=data.device, dtype=data.dtype)
-        one_hot.scatter_(1, assignments.unsqueeze(1), 1.0)
-        weighted_one_hot = one_hot * weights.unsqueeze(1)  # (N, K)
-
-        cluster_weights = weighted_one_hot.sum(dim=0)  # (K,)
-        new_centroids = weighted_one_hot.T @ data  # (K, d)
-
-        # Avoid division by zero for empty clusters — keep old centroid
-        nonempty = cluster_weights > 0
-        new_centroids[nonempty] /= cluster_weights[nonempty].unsqueeze(1)
-        new_centroids[~nonempty] = centroids[~nonempty]
-        centroids = new_centroids
-
-    return centroids
-
 
 def _batched_weighted_kmeans(
     data: torch.Tensor,
@@ -130,8 +77,12 @@ def _batched_weighted_kmeans(
     K: int,
     niter: int,
     seed: int = 0,
+    max_batch: int = 8,
 ) -> torch.Tensor:
     """Batched weighted k-means — runs B independent k-means in parallel.
+
+    Processes experts in chunks of max_batch to limit GPU memory.
+    The main memory cost per chunk is the (batch, N, K) distance tensor.
 
     Args:
         data: Training vectors. Shape: (B, N, d). float32.
@@ -139,17 +90,39 @@ def _batched_weighted_kmeans(
         K: Number of centroids per batch element.
         niter: Number of iterations.
         seed: Random seed.
+        max_batch: Max experts to process in one GPU batch.
 
     Returns:
         centroids: Shape: (B, K, d). float32. Same device as data.
     """
+    B = data.shape[0]
+    if B <= max_batch:
+        return _batched_weighted_kmeans_core(data, weights, K, niter, seed)
+
+    # Chunk over experts
+    chunks = []
+    for start in range(0, B, max_batch):
+        end = min(start + max_batch, B)
+        chunk = _batched_weighted_kmeans_core(
+            data[start:end], weights[start:end], K, niter, seed + start
+        )
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=0)
+
+
+def _batched_weighted_kmeans_core(
+    data: torch.Tensor,
+    weights: torch.Tensor,
+    K: int,
+    niter: int,
+    seed: int,
+) -> torch.Tensor:
+    """Core batched weighted k-means for a single chunk of experts."""
     B, N, d = data.shape
 
     # Initialize centroids via weighted random sampling, per batch element
     gen = torch.Generator(device=data.device).manual_seed(seed)
     probs = weights / weights.sum(dim=1, keepdim=True)  # (B, N)
-    # multinomial doesn't support batched generation with a single generator
-    # deterministically, so we loop for init only (cheap — just K=256 samples)
     all_centroids = []
     for b in range(B):
         init_idx = torch.multinomial(probs[b], K, replacement=False, generator=gen)
@@ -160,21 +133,22 @@ def _batched_weighted_kmeans(
         # Assignment: (B, N, K) distances
         dists = torch.cdist(data, centroids, p=2.0).square()  # (B, N, K)
         assignments = dists.argmin(dim=2)  # (B, N)
+        del dists
 
         # Update: weighted mean per cluster
         one_hot = torch.zeros(B, N, K, device=data.device, dtype=data.dtype)
         one_hot.scatter_(2, assignments.unsqueeze(2), 1.0)
         weighted_one_hot = one_hot * weights.unsqueeze(2)  # (B, N, K)
+        del one_hot
 
         cluster_weights = weighted_one_hot.sum(dim=1)  # (B, K)
         # (B, K, N) @ (B, N, d) -> (B, K, d)
         new_centroids = torch.bmm(weighted_one_hot.transpose(1, 2), data)
+        del weighted_one_hot
 
         nonempty = cluster_weights > 0  # (B, K)
-        # Safe division
         divisor = cluster_weights.unsqueeze(2).clamp(min=1e-10)
         new_centroids = new_centroids / divisor
-        # Keep old centroids for empty clusters
         new_centroids = torch.where(
             nonempty.unsqueeze(2), new_centroids, centroids
         )
