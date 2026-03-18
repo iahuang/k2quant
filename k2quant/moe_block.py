@@ -161,9 +161,7 @@ class QuantizableMoEBlock(nn.Module):
             names=["down"],
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE forward with optional BCOS correction.
 
         Args:
@@ -171,9 +169,7 @@ class QuantizableMoEBlock(nn.Module):
                 (batch, seq_len, hidden_size) or (num_tokens, hidden_size).
 
         Returns:
-            Tuple of (output, router_logits).
-            Output has same shape as input. Router logits are
-            (num_tokens, num_experts) for auxiliary loss computation.
+            Output activations, same shape as input.
         """
         if self._collecting:
             self._collected_inputs.append(hidden_states.detach().cpu())
@@ -249,7 +245,7 @@ class QuantizableMoEBlock(nn.Module):
                 )
             final_hidden_states = final_hidden_states + shared_output
 
-        return final_hidden_states.reshape(input_shape), router_logits
+        return final_hidden_states.reshape(input_shape)
 
     def compute_routed_calibration(
         self,
