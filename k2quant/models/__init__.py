@@ -1,3 +1,3 @@
-from .qwen_moe import QwenMoEBlock
+from .qwen_moe import QwenExperts
 
-__all__ = ["QwenMoEBlock"]
+__all__ = ["QwenExperts"]
