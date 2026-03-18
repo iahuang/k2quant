@@ -316,10 +316,6 @@ def _reconstruct_col(
         recon = codebooks[ei][indices[ei].long()]  # (oc, n_subvecs, d)
         W_recon[ei] = recon.reshape(oc, ic_padded)
 
-        if result.res_indices is not None and result.res_codebooks is not None:
-            res_recon = result.res_codebooks[ei][result.res_indices[ei].long()]
-            W_recon[ei] += res_recon.reshape(oc, ic_padded)
-
     # Undo column permutation
     if result.col_invperm is not None:
         W_recon = W_recon[:, :, result.col_invperm.cpu()]
