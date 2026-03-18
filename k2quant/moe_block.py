@@ -48,6 +48,7 @@ class QuantizableMoEBlock(nn.Module):
         top_k: int,
         act_fn: Callable = F.silu,
         *,
+        norm_topk_prob: bool = False,
         device: Optional[torch.device | str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -57,6 +58,7 @@ class QuantizableMoEBlock(nn.Module):
         self.intermediate_size = intermediate_size
         self.top_k = top_k
         self.act_fn = act_fn
+        self.norm_topk_prob = norm_topk_prob
 
         # Expert weights — standardized layout
         self.gate_up_proj = nn.Parameter(
@@ -71,6 +73,11 @@ class QuantizableMoEBlock(nn.Module):
             torch.empty(num_experts, hidden_size,
                         device=device, dtype=dtype)
         )
+
+        # Shared expert — some MoE architectures (e.g. Qwen) have an
+        # always-on expert that processes all tokens. Set by from_hf_module().
+        self.shared_expert: Optional[nn.Module] = None
+        self.shared_expert_gate: Optional[nn.Module] = None
 
         # BCOS correction params — None until quantization sets them.
         # Not nn.Parameters (not trained), just tensors on the right device.
@@ -154,7 +161,9 @@ class QuantizableMoEBlock(nn.Module):
             names=["down"],
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """MoE forward with optional BCOS correction.
 
         Args:
@@ -162,7 +171,9 @@ class QuantizableMoEBlock(nn.Module):
                 (batch, seq_len, hidden_size) or (num_tokens, hidden_size).
 
         Returns:
-            Output activations. Same shape as input.
+            Tuple of (output, router_logits).
+            Output has same shape as input. Router logits are
+            (num_tokens, num_experts) for auxiliary loss computation.
         """
         if self._collecting:
             self._collected_inputs.append(hidden_states.detach().cpu())
@@ -173,12 +184,13 @@ class QuantizableMoEBlock(nn.Module):
 
         # Routing
         router_logits = F.linear(hidden_states, self.router)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
         top_k_weights, top_k_indices = torch.topk(
             routing_weights, k=self.top_k, dim=-1
         )
-        # Normalize top-k weights to sum to 1
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        if self.norm_topk_prob:
+            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights = top_k_weights.to(hidden_states.dtype)
 
         # Expert dispatch
         final_hidden_states = torch.zeros_like(hidden_states)
@@ -228,7 +240,16 @@ class QuantizableMoEBlock(nn.Module):
                 0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
             )
 
-        return final_hidden_states.reshape(input_shape)
+        # Shared expert (e.g. Qwen's always-on expert with sigmoid gate)
+        if self.shared_expert is not None:
+            shared_output = self.shared_expert(hidden_states)
+            if self.shared_expert_gate is not None:
+                shared_output = (
+                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                )
+            final_hidden_states = final_hidden_states + shared_output
+
+        return final_hidden_states.reshape(input_shape), router_logits
 
     def compute_routed_calibration(
         self,
