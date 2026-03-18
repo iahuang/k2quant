@@ -31,6 +31,10 @@ import torch.nn as nn
 
 from .config import QuantConfig
 
+# Max training vectors per expert for k-means. K=256 centroids in d=4
+# space converge well with 16-32K samples. More is wasteful.
+_KMEANS_MAX_TRAIN = 32_768
+
 
 @dataclasses.dataclass
 class VQResult:
@@ -70,14 +74,13 @@ class VQResult:
 # ── Weighted k-means in PyTorch ───────────────────────────────────────────
 
 
-
 def _batched_weighted_kmeans(
     data: torch.Tensor,
     weights: torch.Tensor,
     K: int,
     niter: int,
     seed: int = 0,
-    max_batch: int = 8,
+    max_batch: int = 16,
 ) -> torch.Tensor:
     """Batched weighted k-means — runs B independent k-means in parallel.
 
@@ -99,7 +102,6 @@ def _batched_weighted_kmeans(
     if B <= max_batch:
         return _batched_weighted_kmeans_core(data, weights, K, niter, seed)
 
-    # Chunk over experts
     chunks = []
     for start in range(0, B, max_batch):
         end = min(start + max_batch, B)
@@ -130,10 +132,15 @@ def _batched_weighted_kmeans_core(
     centroids = torch.stack(all_centroids)  # (B, K, d)
 
     for _ in range(niter):
-        # Assignment: (B, N, K) distances
-        dists = torch.cdist(data, centroids, p=2.0).square()  # (B, N, K)
+        # Assignment via decomposed L2: ||x-c||^2 = ||x||^2 - 2*x@c^T + ||c||^2
+        # This avoids materializing (B, N, K, d) intermediates.
+        x_sq = (data * data).sum(dim=2, keepdim=True)  # (B, N, 1)
+        c_sq = (centroids * centroids).sum(dim=2, keepdim=True)  # (B, K, 1)
+        # (B, N, d) @ (B, d, K) -> (B, N, K)
+        dot = torch.bmm(data, centroids.transpose(1, 2))
+        dists = x_sq - 2 * dot + c_sq.transpose(1, 2)  # (B, N, K)
         assignments = dists.argmin(dim=2)  # (B, N)
-        del dists
+        del dists, dot, x_sq, c_sq
 
         # Update: weighted mean per cluster
         one_hot = torch.zeros(B, N, K, device=data.device, dtype=data.dtype)
@@ -186,13 +193,14 @@ def _gptq_with_codebook(
     oc, ic = W_np.shape
     n_subvecs = ic // d
 
-    # Build a simple brute-force index for nearest centroid lookup.
-    # For K=256, d=4 this is a (oc, K) distance matrix — trivial.
-    # Using numpy to avoid faiss dependency in this function.
     W = W_np.copy()  # already float64
     indices = np.zeros((oc, n_subvecs), dtype=np.int32)
     Hinv = Hinv_np  # already float64
     centroids_f64 = centroids_np.astype(np.float64)
+
+    # Precompute ||c||^2 for fast L2: ||x-c||^2 = ||x||^2 - 2*x@c^T + ||c||^2
+    c_sq = (centroids_np * centroids_np).sum(axis=1)  # (K,)
+    cT = centroids_np.T.copy()  # (d, K) — contiguous for matmul
 
     for i1 in range(0, ic, block_size):
         i2 = min(i1 + block_size, ic)
@@ -205,11 +213,9 @@ def _gptq_with_codebook(
         for j in range(0, count - d + 1, d):
             sv = W1[:, j : j + d].astype(np.float32)  # (oc, d)
 
-            # Nearest centroid lookup: (oc, K) distances
-            # sv: (oc, d), centroids: (K, d) -> dists: (oc, K)
-            dists = ((sv[:, np.newaxis, :] - centroids_np[np.newaxis, :, :]) ** 2).sum(
-                axis=2
-            )
+            # Fast L2 nearest centroid: matmul decomposition
+            # sv @ cT -> (oc, K), avoids (oc, K, d) broadcast
+            dists = (sv * sv).sum(axis=1, keepdims=True) - 2.0 * (sv @ cT) + c_sq
             idx = dists.argmin(axis=1).astype(np.int32)  # (oc,)
 
             sv_idx = (i1 + j) // d
@@ -246,8 +252,9 @@ def vq_quantize(
     Hessian-weighted k-means + GPTQ error propagation + column ordering.
 
     Two-phase approach:
-    1. K-means codebook training: batched across all experts on GPU with
-       true weighted k-means (no oversampling approximation).
+    1. K-means codebook training: batched across experts on GPU with
+       true weighted k-means (no oversampling approximation). Training
+       uses a weighted subsample of subvectors (up to 32K per expert).
     2. GPTQ error propagation: per-expert on CPU (inherently sequential).
 
     Args:
@@ -292,23 +299,40 @@ def vq_quantize(
     col_invperm = torch.argsort(col_perm)
     Hinv = Hinv[col_perm][:, col_perm]
     W_quant = W_quant[:, :, col_perm]
-    h_diag = H.diagonal()[col_perm]  # (ic_h,) — keep as tensor for GPU k-means
+    h_diag = H.diagonal()[col_perm]  # (ic_h,)
 
     # ── Phase 1: Batched weighted k-means (GPU) ──────────────────────────
     n_subvecs = ic_padded // d
-    # Reshape weights into subvectors: (n, oc, n_subvecs, d)
-    flat = W_quant.reshape(n, oc, n_subvecs, d)
-    # Training data: (n, oc * n_subvecs, d)
-    train_data = flat.reshape(n, oc * n_subvecs, d)
 
-    # Per-subvector Hessian weights, broadcast across oc rows
+    # Per-subvector Hessian weights
     subvec_weights = h_diag.reshape(n_subvecs, d).mean(dim=1)  # (n_subvecs,)
     subvec_weights = subvec_weights.clamp(min=0)
-    # Expand to match training data: each of oc rows gets the same
-    # subvector weight pattern -> (oc * n_subvecs,)
-    per_vec_weights = subvec_weights.repeat(oc)  # (oc * n_subvecs,)
-    # Broadcast to all experts: (n, oc * n_subvecs)
-    per_vec_weights = per_vec_weights.unsqueeze(0).expand(n, -1)
+
+    # Reshape into subvectors: (n, oc, n_subvecs, d)
+    flat = W_quant.reshape(n, oc, n_subvecs, d)
+
+    # Total subvectors per expert: oc * n_subvecs. Subsample if too large.
+    N_total = oc * n_subvecs
+    if N_total <= _KMEANS_MAX_TRAIN:
+        # Use all subvectors
+        train_data = flat.reshape(n, N_total, d)
+        per_vec_weights = subvec_weights.repeat(oc)  # (N_total,)
+        per_vec_weights = per_vec_weights.unsqueeze(0).expand(n, -1)
+    else:
+        # Weighted subsample: sample rows proportional to uniform,
+        # but preserve subvec weight structure.
+        # Sample a subset of oc rows, use all n_subvecs positions per row.
+        max_rows = _KMEANS_MAX_TRAIN // n_subvecs
+        gen = torch.Generator(device=W_quant.device).manual_seed(cfg.seed)
+        row_idx = torch.randint(oc, (n, max_rows), generator=gen)  # (n, max_rows)
+        # Gather: (n, max_rows, n_subvecs, d)
+        train_data = torch.gather(
+            flat,
+            1,
+            row_idx.unsqueeze(2).unsqueeze(3).expand(-1, -1, n_subvecs, d),
+        ).reshape(n, max_rows * n_subvecs, d)
+        per_vec_weights = subvec_weights.repeat(max_rows)
+        per_vec_weights = per_vec_weights.unsqueeze(0).expand(n, -1)
 
     all_centroids = _batched_weighted_kmeans(
         train_data, per_vec_weights, K, cfg.vq_kmeans_niter, seed=cfg.seed
