@@ -186,7 +186,7 @@ class QuantizableMoEBlock(nn.Module):
         )
         if self.norm_topk_prob:
             top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_weights.to(hidden_states.dtype)
+        top_k_weights = top_k_weights.to(routing_weights.dtype)
 
         # Expert dispatch
         final_hidden_states = torch.zeros_like(hidden_states)
