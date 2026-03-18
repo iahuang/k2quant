@@ -41,6 +41,7 @@ def _swap_moe_blocks(
                 name = n
                 break
         blocks.append((name, qmoe))
+        print(f"   {li} Swapped {name} with {qmoe}")
         del hf_moe
     gc.collect()
     torch.cuda.empty_cache()

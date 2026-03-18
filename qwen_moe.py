@@ -49,8 +49,13 @@ def main():
 
     print("\n[1/4] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME, cache_dir=CACHE_DIR, trust_remote_code=True
+        MODEL_NAME,
+        cache_dir=CACHE_DIR,
+        trust_remote_code=True,
+        use_fast=True,
     )
+    if not tokenizer.is_fast:
+        raise RuntimeError(f"{MODEL_NAME} did not load a fast tokenizer")
 
     print("\n[2/4] Loading calibration data...")
     calib_data = get_calibration_data(

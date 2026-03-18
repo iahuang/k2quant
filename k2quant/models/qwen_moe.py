@@ -23,7 +23,7 @@ class QwenMoEBlock(QuantizableMoEBlock):
         """Convert a Qwen HF MoE module to a QwenMoEBlock.
 
         Expected HF module structure:
-            hf_moe.num_experts: int
+            hf_moe.experts.num_experts: int
             hf_moe.gate.weight: (num_experts, hidden_size)
             hf_moe.gate.top_k: int
             hf_moe.experts.gate_up_proj: (num_experts, 2*inter, hidden)
@@ -31,7 +31,7 @@ class QwenMoEBlock(QuantizableMoEBlock):
             hf_moe.experts.act_fn: activation function
         """
         block = cls(
-            num_experts=hf_moe.num_experts,
+            num_experts=hf_moe.experts.num_experts,
             hidden_size=hf_moe.gate.weight.shape[1],
             intermediate_size=hf_moe.experts.down_proj.shape[2],
             top_k=hf_moe.gate.top_k,

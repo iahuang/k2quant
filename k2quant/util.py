@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 from datasets import load_dataset
+from typing import Callable
 
 
 def get_calibration_data(
@@ -37,16 +38,74 @@ def get_calibration_data(
     dataset = load_dataset(
         dataset_name, dataset_config, split=split, cache_dir=cache_dir
     )
-    all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
-    print("  Tokenizing...")
-    all_tokens = tokenizer(all_text, return_tensors="pt", truncation=False)[
-        "input_ids"
-    ][0]
+
+    # Tokenize only enough corpus to draw calibration windows instead of
+    # encoding the full dataset split up front.
+    min_total_tokens = seqlen + nsamples - 1
+    target_total_tokens = max(min_total_tokens, nsamples * seqlen)
+    separator_tokens = tokenizer(
+        "\n\n",
+        add_special_tokens=False,
+        return_attention_mask=False,
+        truncation=False,
+        return_tensors="pt",
+    )["input_ids"][0]
+
+    print(f"  Tokenizing until ~{target_total_tokens:,} tokens...")
+    token_chunks: list[torch.Tensor] = []
+    text_batch: list[str] = []
+    total_tokens = 0
+
+    def flush_batch() -> None:
+        nonlocal total_tokens
+        nonlocal text_batch
+
+        if not text_batch:
+            return
+
+        batch_token_ids = tokenizer(
+            text_batch,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            truncation=False,
+        )["input_ids"]
+
+        for token_ids in batch_token_ids:
+            if not token_ids:
+                continue
+            if token_chunks and len(separator_tokens) > 0:
+                token_chunks.append(separator_tokens.clone())
+                total_tokens += len(separator_tokens)
+            ids_tensor = torch.tensor(token_ids, dtype=torch.long)
+            token_chunks.append(ids_tensor)
+            total_tokens += len(ids_tensor)
+
+        text_batch = []
+
+    for row in dataset:
+        text = row["text"]
+        if not text or not text.strip():
+            continue
+        text_batch.append(text)
+        if len(text_batch) >= 128:
+            flush_batch()
+            if total_tokens >= target_total_tokens:
+                break
+
+    flush_batch()
+
+    if total_tokens < min_total_tokens:
+        raise ValueError(
+            f"Need at least {min_total_tokens} tokens for calibration, got "
+            f"{total_tokens}"
+        )
+
+    all_tokens = torch.cat(token_chunks)
     print(f"  Total tokens: {len(all_tokens)}")
 
     rng = np.random.RandomState(seed)
-    max_start = len(all_tokens) - seqlen
-    starts = rng.choice(max_start, size=nsamples, replace=False)
+    n_starts = len(all_tokens) - seqlen + 1
+    starts = rng.choice(n_starts, size=nsamples, replace=False)
     samples = [all_tokens[s : s + seqlen] for s in starts]
     return torch.stack(samples)  # (nsamples, seqlen)
 
