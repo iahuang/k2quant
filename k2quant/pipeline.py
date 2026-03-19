@@ -1,14 +1,3 @@
-"""High-level quantization pipeline for MoE models.
-
-Provides quantize_model() as the single entry point. Collects calibration
-activations through the unmodified HF forward (preserving bit-identical
-routing and shared expert behavior), then swaps only the experts
-sub-module for quantization with BCOS corrections.
-
-This avoids compound float16 divergence from reimplementing the full MoE
-forward path — routing and shared expert code remain HF's original.
-"""
-
 from __future__ import annotations
 
 import gc

@@ -1,27 +1,13 @@
 """
-Vector Quantization (VQ) modeled after VPTQ (Liu et al., 2024) and GPTVQ (van Baalen et al., 2024).
+Vector Quantization (VQ) implementing VPTQ (Liu et al., 2024).
 
-Hessian-weighted k-means initialization + GPTQ-style column-by-column
-error propagation. Operates on per-expert weight matrices independently,
-parallelized across experts via ThreadPoolExecutor.
+Channel-independent second-order optimization: subvectors span V contiguous
+output rows for each input column. Each column is fully quantized before
+error propagates to the next, so every centroid is chosen on fully-corrected
+weights. This is faithful to Algorithm 1 in the VPTQ paper.
 
-Important notes:
-
- -  Subvectors span d contiguous input columns for one
-    output channel row. This is GPTVQ-style grouped quantization: the
-    centroid locks in all d column values at once, so columns j+1..j+d-1
-    within each group do NOT benefit from error correction before their
-    values are committed. Intra-group scalar error propagation updates
-    the remaining workspace but cannot revisit the centroid choice.
-    Despite this theoretical disadvantage, empirically better for perplexity.
-
- -  Column ordering: low-sensitivity columns are processed first (ascending
-    diag(H_inv)), so their errors propagate to less important columns. This contribution
-    is unique to this implementation, but it empirically provides a significant improvement in
-    perplexity.
-
--   Residual VQ: This part is intentionally omitted for simplicity. Empirical testing found that it
-    provides little to no benefit in the context of KBVQ-MoE.
+Column ordering: low-sensitivity columns are processed first (ascending
+diag(H_inv)), so their errors propagate to less important columns.
 """
 
 from __future__ import annotations
@@ -42,95 +28,81 @@ class VQResult:
     """Result of VQ for a batch of experts.
 
     Stores everything needed to reconstruct quantized weights.
-    Index and codebook shapes:
-      indices (n_experts, oc, ic_padded // d), codebooks (n_experts, K, d)
+    Row-axis (VPTQ): indices (n_experts, oc_padded // V, ic), codebooks (n_experts, K, V)
     """
 
     main_indices: torch.Tensor
-    """Main codebook indices. int32. Shape depends on vq_axis."""
+    """Main codebook indices. int32."""
 
     main_codebooks: torch.Tensor
-    """Main codebook centroids. float16. Shape depends on vq_axis."""
+    """Main codebook centroids. float16."""
 
     oc_pad: int
-    """Number of zero-padding rows added to make oc divisible by V (row axis).
-    Always 0 for col axis."""
+    """Number of zero-padding rows added to make oc divisible by V."""
 
     oc_padded: int
     """Padded output channel dimension: oc + oc_pad."""
 
     ic_pad: int
-    """Number of zero-padding columns added to make ic divisible by d (col axis).
-    Always 0 for row axis."""
+    """Always 0 for row axis."""
 
     ic_padded: int
-    """Padded input channel dimension: ic + ic_pad."""
+    """Same as ic for row axis."""
 
     col_invperm: torch.Tensor
-    """Inverse column permutation to undo GPTQ column ordering.
-    Shape: (ic_padded,) for col axis, (ic,) for row axis. int64.
-    Apply as W_recon[:, :, col_invperm]."""
+    """Inverse column permutation to undo column ordering.
+    Shape: (ic,). int64. Apply as W_recon[:, :, col_invperm]."""
 
 
-def _vptq_one_expert_col(args: tuple) -> tuple:
-    """VPTQ quantization for a single expert, col-axis mode (GPTVQ-style).
+def _vptq_one_expert_row(args: tuple) -> tuple:
+    """VPTQ quantization for a single expert (paper-faithful row-axis mode).
 
-    Subvectors span d contiguous input columns for each output row.
-    The centroid assignment is atomic over d columns — all d values are
-    committed by one lookup. Intra-group scalar error propagation then
-    updates the remaining workspace, but cannot revisit the centroid
-    choice for columns j+1..j+d-1 within the group.
+    Subvectors span V contiguous output rows for each input column.
+    Each column is fully quantized (all its V-length subvectors assigned
+    to centroids) before error propagation to the next column. This means
+    every centroid choice is made on fully-corrected weights.
 
     Args:
-        args: Tuple of (W_np, Hinv_np, h_diag_np, d, K, niter,
-              block_size).
+        args: Tuple of (W_np, Hinv_np, h_diag_np, V, K, niter, block_size).
 
     Returns:
         Tuple of (indices, centroids).
     """
-    W_np, Hinv_np, h_diag_np, d, K, niter, block_size = args
-    oc, ic = W_np.shape  # single expert: (oc, ic_padded)
-    n_subvecs = ic // d
+    W_np, Hinv_np, h_diag_np, V, K, niter, block_size = args
+    oc, ic = W_np.shape  # single expert: (oc_padded, ic)
+    n_row_subvecs = oc // V
 
     # ── 1. Hessian-weighted k-means ──────────────────────────────────────
-    # NOTE: The paper describes true weighted k-means where each training
-    # vector receives a Hessian-derived scalar weight in the loss function.
-    # This is approximated via oversampling: subvector positions spanning
-    # higher diag(H) columns contribute more training vectors to the
-    # codebook. This avoids modifying faiss's optimized k-means
-    # implementation. The approximation biases centroid placement toward
-    # important regions but does not minimize the exact weighted objective.
-    #
-    # Compute per-subvector importance from Hessian diagonal.
-    # Cap at 4x to prevent a single subvector from dominating training.
-    # This cap is not in the paper — chosen empirically.
-    subvec_weights = h_diag_np.reshape(n_subvecs, d).mean(axis=1)  # (n_subvecs,)
-    flat = W_np.reshape(oc, n_subvecs, d)  # (oc, n_subvecs, d)
-
-    if subvec_weights.sum() > 0:
-        norm_w = subvec_weights / (subvec_weights.mean() + 1e-10)
+    # Approximate weighted k-means via oversampling: columns with higher
+    # diag(H) values contribute more training vectors to the codebook.
+    if h_diag_np.sum() > 0:
+        norm_w = h_diag_np / (h_diag_np.mean() + 1e-10)
         repeat_counts = np.clip(np.round(norm_w).astype(int), 1, 4)
     else:
-        repeat_counts = np.ones(n_subvecs, dtype=int)
+        repeat_counts = np.ones(ic, dtype=int)
 
     train_parts = []
-    for sv in range(n_subvecs):
-        vecs = flat[:, sv, :]  # (oc, d)
-        for _ in range(repeat_counts[sv]):
-            train_parts.append(vecs)
+    for col in range(ic):
+        col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)  # (n_row_subvecs, V)
+        for _ in range(repeat_counts[col]):
+            train_parts.append(col_subvecs)
     train_data = np.vstack(train_parts).astype(np.float32)
 
-    km = faiss.Kmeans(d, K, niter=niter, verbose=False, gpu=False)
+    km = faiss.Kmeans(V, K, niter=niter, verbose=False, gpu=False)
     km.train(train_data)
-    centroids = km.centroids.copy().astype(np.float32)  # (K, d)
+    centroids = km.centroids.copy().astype(np.float32)  # (K, V)
 
-    search_index = faiss.IndexFlatL2(d)
+    search_index = faiss.IndexFlatL2(V)
     search_index.add(centroids)
 
-    # ── 2. GPTQ-style error propagation ──────────────────────────────────
+    # ── 2. Column-by-column error propagation (VPTQ Algorithm 1) ─────────
+    # For each column, slice all oc rows into V-length subvectors, assign
+    # to nearest centroid. Then propagate the full-column error to all
+    # remaining columns before moving on.
     W = W_np.copy().astype(np.float64)
-    indices = np.zeros((oc, n_subvecs), dtype=np.int32)
+    indices = np.zeros((n_row_subvecs, ic), dtype=np.int32)
     Hinv = Hinv_np.astype(np.float64)
+    centroids_f64 = centroids.astype(np.float64)
 
     for i1 in range(0, ic, block_size):
         i2 = min(i1 + block_size, ic)
@@ -140,27 +112,23 @@ def _vptq_one_expert_col(args: tuple) -> tuple:
         Err1 = np.zeros_like(W1)
         Hinv1 = Hinv[i1:i2, i1:i2]  # (count, count)
 
-        # Process subvectors (groups of d columns) within this block
-        for j in range(0, count - d + 1, d):
-            sv = W1[:, j : j + d].astype(np.float32)  # (oc, d)
-            _, idx = search_index.search(sv, 1)  # (oc, 1)
-            idx = idx.reshape(-1)  # (oc,)
+        # Process one column at a time
+        for j in range(count):
+            col_vec = W1[:, j]  # (oc,)
+            sv = col_vec.reshape(n_row_subvecs, V).astype(np.float32)
+            _, idx = search_index.search(sv, 1)
+            idx = idx.reshape(-1)
+            indices[:, i1 + j] = idx
 
-            sv_idx = (i1 + j) // d
-            indices[:, sv_idx] = idx
-            q_sv = centroids[idx].astype(np.float64)  # (oc, d)
+            q_col = centroids_f64[idx].reshape(oc)
 
-            # Propagate errors column by column within subvector
-            for c in range(d):
-                col = j + c
-                err = (W1[:, col] - q_sv[:, c]) / Hinv1[col, col]  # (oc,)
-                Err1[:, col] = err
-                if col + 1 < count:
-                    W1[:, col + 1 :] -= (
-                        err[:, np.newaxis] * Hinv1[col, col + 1 : count][np.newaxis, :]
-                    )
+            err = (W1[:, j] - q_col) / Hinv1[j, j]
+            Err1[:, j] = err
+            if j + 1 < count:
+                W1[:, j + 1 :] -= (
+                    err[:, np.newaxis] * Hinv1[j, j + 1 : count][np.newaxis, :]
+                )
 
-        # Inter-block error propagation
         if i2 < ic:
             W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
 
@@ -173,12 +141,9 @@ def vq_quantize(
     cfg: QuantConfig,
 ) -> VQResult:
     """
-    VPTQ-based vector quantization.
+    VPTQ-based vector quantization (paper-faithful row-axis mode).
 
-    Hessian-weighted k-means + GPTQ error propagation + column ordering.
-
-    Quantizes a batch of expert weight matrices with output-aware error
-    minimization. Each expert is processed independently in a thread pool.
+    Hessian-weighted k-means + column-by-column error propagation.
 
     Args:
         W_quant: Weight residuals after IDRE.
@@ -188,54 +153,40 @@ def vq_quantize(
         cfg: Quantization configuration (QuantConfig).
 
     Returns:
-        VPTQResult with all indices, codebooks, and column permutation info.
+        VQResult with all indices, codebooks, and column permutation info.
     """
     n, oc, ic = W_quant.shape
     K = cfg.codebook_size
-    d = cfg.vq_d
+    V = cfg.vq_d  # subvector dimension = V rows
 
-    # ── Padding ───────────────────────────────────────────────────────────
-    # Pad ic to be divisible by d
-    ic_pad = (d - ic % d) % d
-    oc_pad = 0
-    if ic_pad > 0:
-        W_quant = nn.functional.pad(W_quant, (0, ic_pad))
-    ic_padded = ic + ic_pad
-    oc_padded = oc
-
-    # ── Hessian padding (col axis only) ──────────────────────────────────
-    if ic_pad > 0:
-        H_padded = torch.zeros(ic_padded, ic_padded, dtype=H.dtype, device=H.device)
-        H_padded[:ic, :ic] = H
-        for p in range(ic, ic_padded):
-            H_padded[p, p] = H.diagonal().mean() * cfg.vptq_damp_percent
-        H = H_padded
+    # ── Padding: pad oc to be divisible by V ──────────────────────────────
+    oc_pad = (V - oc % V) % V
+    ic_pad = 0
+    if oc_pad > 0:
+        W_quant = nn.functional.pad(W_quant, (0, 0, 0, oc_pad))  # pad rows
+    oc_padded = oc + oc_pad
+    ic_padded = ic
 
     # ── Compute upper Cholesky of H^{-1} (shared across all experts) ────
-    # Damping prevents singularity when some input features have zero variance.
-    ic_h = ic_padded
     damp = cfg.vptq_damp_percent * H.diagonal().mean()
-    H_damp = H + damp * torch.eye(ic_h, device=H.device, dtype=H.dtype)
-    H_inv = torch.linalg.inv(H_damp.double()).float()  # (ic_h, ic_h)
-    # Upper Cholesky factorization for numerical stability in GPTQ loop.
-    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()  # (ic_h, ic_h)
+    H_damp = H + damp * torch.eye(ic, device=H.device, dtype=H.dtype)
+    H_inv = torch.linalg.inv(H_damp.double()).float()
+    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()
 
     # ── Column ordering ──────────────────────────────────────────────────
     # Sort columns by ascending diag(H_inv): process easy/low-sensitivity
     # columns first. Their quantization errors propagate to columns that
     # are less affected by perturbation, while high-sensitivity columns
     # are quantized last with the benefit of all prior error corrections.
-    col_perm = torch.argsort(Hinv.diagonal())  # (ic_h,)
-    col_invperm = torch.argsort(col_perm)  # (ic_h,)
+    col_perm = torch.argsort(Hinv.diagonal())
+    col_invperm = torch.argsort(col_perm)
     Hinv = Hinv[col_perm][:, col_perm]
     W_quant = W_quant[:, :, col_perm]
-    h_diag_np = H.diagonal()[col_perm].cpu().float().numpy()  # (ic_h,)
+    h_diag_np = H.diagonal()[col_perm].cpu().float().numpy()
 
     Hinv_np = Hinv.cpu().numpy()
 
     # ── Dispatch per-expert VPTQ to thread pool ──────────────────────────
-    worker_fn = _vptq_one_expert_col
-
     work_items = []
     for ei in range(n):
         W_np = W_quant[ei].cpu().float().numpy()
@@ -244,7 +195,7 @@ def vq_quantize(
                 W_np,
                 Hinv_np,
                 h_diag_np,
-                d,
+                V,
                 K,
                 cfg.vq_kmeans_niter,
                 cfg.vptq_block_size,
@@ -252,7 +203,7 @@ def vq_quantize(
         )
 
     with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
-        results = list(pool.map(worker_fn, work_items))
+        results = list(pool.map(_vptq_one_expert_row, work_items))
 
     # ── Collect results ──────────────────────────────────────────────────
     all_indices = []
@@ -282,12 +233,8 @@ def vq_reconstruct(
     """
     Reconstruct weight matrices from VQ quantization results.
 
-    Looks up each subvector's centroid from the codebook, optionally adds
-    the residual codebook contribution, undoes column permutation, and
-    strips padding.
-
     Args:
-        result: VPTQResult from vptq_quantize().
+        result: VQResult from vq_quantize().
         n_experts: Number of experts.
         oc: Output channels (rows per expert, before padding).
         ic: Input channels (columns per expert, before padding).
@@ -296,32 +243,25 @@ def vq_reconstruct(
         W_recon: Reconstructed weights.
             Shape: (n_experts, oc, ic). float16.
     """
+    indices = result.main_indices  # (n, n_row_subvecs, ic)
+    codebooks = result.main_codebooks  # (n, K, V)
+    oc_padded = result.oc_padded
 
-    return _reconstruct_col(result, n_experts, oc, ic)
-
-
-def _reconstruct_col(
-    result: VQResult,
-    n_experts: int,
-    oc: int,
-    ic: int,
-) -> torch.Tensor:
-    """Reconstruct from col-axis indices: (n, oc, n_subvecs) + codebook (n, K, d)."""
-    indices = result.main_indices  # (n, oc, n_subvecs)
-    codebooks = result.main_codebooks  # (n, K, d)
-    ic_padded = result.ic_padded
-
-    W_recon = torch.zeros(n_experts, oc, ic_padded, dtype=codebooks.dtype)
+    W_recon = torch.zeros(n_experts, oc_padded, ic, dtype=codebooks.dtype)
     for ei in range(n_experts):
-        recon = codebooks[ei][indices[ei].long()]  # (oc, n_subvecs, d)
-        W_recon[ei] = recon.reshape(oc, ic_padded)
+        for col in range(ic):
+            # indices[ei, :, col] -> (n_row_subvecs,) centroid indices
+            # codebooks[ei][indices] -> (n_row_subvecs, V)
+            W_recon[ei, :, col] = codebooks[ei][indices[ei, :, col].long()].reshape(
+                oc_padded
+            )
 
     # Undo column permutation
     if result.col_invperm is not None:
         W_recon = W_recon[:, :, result.col_invperm.cpu()]
 
-    # Strip column padding
-    if result.ic_pad > 0:
-        W_recon = W_recon[:, :, :ic]
+    # Strip row padding
+    if result.oc_pad > 0:
+        W_recon = W_recon[:, :oc, :]
 
     return W_recon

@@ -45,8 +45,7 @@ def w_quantize(
     Steps:
     1. IDRE: extract shared component W_share (kept at full precision).
     2. Compute Hessian H = X^T X / n from calibration activations.
-    3. VPTQ: quantize residual (W - W_share) with Hessian-weighted k-means,
-       GPTQ error propagation, and column ordering.
+    3. VPTQ: quantize residual (W - W_share) with Hessian-weighted k-means, error propagation and column ordering.
 
     Args:
         W: Expert weight matrices.

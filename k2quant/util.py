@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 from datasets import load_dataset
@@ -10,16 +9,16 @@ def get_calibration_data(
     nsamples: int = 256,
     seqlen: int = 4096,
     seed: int = 42,
-    dataset_name: str = "wikitext",
-    dataset_config: str = "wikitext-103-raw-v1",
+    dataset_name: str = "allenai/c4",
+    dataset_config: str = "en",
     split: str = "train",
     cache_dir: str | None = None,
 ) -> torch.Tensor:
     """Load and tokenize calibration data from a HuggingFace text dataset.
 
-    Randomly samples `nsamples` contiguous subsequences of length `seqlen`
-    from the concatenated dataset text. Used to compute Hessians and
-    calibration activations for quantization.
+    Streams and shuffles documents, tokenizes each individually (preserving
+    natural token boundaries), and packs tokens into non-overlapping sequences
+    of length `seqlen`. Only downloads as much data as needed.
 
     Args:
         tokenizer: Any HuggingFace tokenizer (model-agnostic).
@@ -36,45 +35,44 @@ def get_calibration_data(
     """
     print(f"  Loading calibration data: {nsamples} samples, seqlen={seqlen}")
     dataset = load_dataset(
-        dataset_name, dataset_config, split=split, cache_dir=cache_dir
+        dataset_name,
+        dataset_config,
+        split=split,
+        cache_dir=cache_dir,
+        streaming=True,
     )
+    dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
 
-    # We need at least nsamples windows of seqlen tokens. Estimate ~4
-    # chars/token and add a 2x safety margin to avoid a second pass.
-    min_tokens = nsamples * seqlen + seqlen
-    target_chars = min_tokens * 8
-    texts = []
-    total_chars = 0
-    for t in dataset["text"]:
-        if not t or not t.strip():
+    print("  Streaming and tokenizing...")
+    samples: list[torch.Tensor] = []
+    buf_chunks: list[torch.Tensor] = []
+    buf_len = 0
+    for example in dataset:
+        doc = example["text"]
+        if not doc.strip():
             continue
-        texts.append(t)
-        total_chars += len(t) + 2  # +2 for "\n\n" separator
-        if total_chars >= target_chars:
+        ids = tokenizer(doc, return_tensors="pt", truncation=False)["input_ids"][0]
+        buf_chunks.append(ids)
+        buf_len += len(ids)
+
+        while buf_len >= seqlen:
+            buf = torch.cat(buf_chunks)
+            samples.append(buf[:seqlen])
+            buf = buf[seqlen:]
+            buf_chunks = [buf] if len(buf) > 0 else []
+            buf_len = len(buf)
+            if len(samples) >= nsamples:
+                break
+
+        if len(samples) >= nsamples:
             break
 
-    # Join and tokenize as a single string so subword merges at text
-    # boundaries are identical to a full-corpus tokenization.
-    all_text = "\n\n".join(texts)
-    print(f"  Tokenizing {len(all_text):,} chars (~{total_chars // 4:,} est. tokens)...")
-    all_tokens = tokenizer(all_text, return_tensors="pt", truncation=False)[
-        "input_ids"
-    ][0]
-
-    if len(all_tokens) < nsamples + seqlen:
-        # Safety: if estimate was too low, fall back to full corpus
-        print("  Estimate too low, tokenizing full corpus...")
-        all_text = "\n\n".join([t for t in dataset["text"] if t.strip()])
-        all_tokens = tokenizer(all_text, return_tensors="pt", truncation=False)[
-            "input_ids"
-        ][0]
-
-    print(f"  Total tokens: {len(all_tokens)}")
-
-    rng = np.random.RandomState(seed)
-    max_start = len(all_tokens) - seqlen
-    starts = rng.choice(max_start, size=nsamples, replace=False)
-    samples = [all_tokens[s : s + seqlen] for s in starts]
+    if len(samples) < nsamples:
+        raise ValueError(
+            f"Only {len(samples)} sequences could be built, "
+            f"but {nsamples} requested. Dataset may be too small."
+        )
+    print(f"  Collected {len(samples)} sequences")
     return torch.stack(samples)  # (nsamples, seqlen)
 
 
@@ -105,8 +103,7 @@ def evaluate_perplexity(
         device: Device for evaluation ("cuda", "cpu", etc.).
         cache_dir: Optional HuggingFace cache directory.
         max_chunks: If set, evaluate only this many chunks (for quick tests).
-        log_fn: Optional callback for progress logging. Called with strings
-            like "Chunk 10/73: PPL = 7.81". Defaults to print().
+        log_fn: Optional callback for progress logging.
 
     Returns:
         Perplexity (float). Lower is better. Computed as

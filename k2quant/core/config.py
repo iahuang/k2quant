@@ -24,9 +24,8 @@ class QuantConfig:
 
         vq_kmeans_niter: K-means iterations for codebook training.
 
-        vptq_block_size: GPTQ block size for error propagation.
-            Should be a multiple of vq_d when vq_axis="col". Balances
-            numerical stability (smaller blocks) vs speed (larger blocks).
+        vptq_block_size: Block size for error propagation.
+            Balances numerical stability (smaller blocks) vs speed (larger blocks).
             128 is standard.
 
         vptq_damp_percent: Hessian damping as fraction of mean diagonal.
