@@ -14,7 +14,7 @@ On the `Qwen1.5-MoE-A2.7B` model, we compare the perplexity (PPL) of the FP16 ba
 
 | Method                           | PPL (WikiText2) ↓ |
 | -------------------------------- | ----------------- |
-| _FP16 Baseline_                  | 6.71              |
+| _FP16 Baseline_                  | 7.22              |
 | KBVQ-MoE (reported)              | 9.61              |
 | KBVQ-MoE + VPTQ (reported)       | 8.78              |
 | **k2quant (no column ordering)** | 8.13              |
@@ -22,8 +22,10 @@ On the `Qwen1.5-MoE-A2.7B` model, we compare the perplexity (PPL) of the FP16 ba
 
 ## Results on All Tested Models
 
-| Model               | Total / Active Parameters | PPL (WikiText2) ↓ |
-| ------------------- | ------------------------- | ----------------- |
-| `Qwen1.5-MoE-A2.7B` | 14.3B / 2.7B              | 7.56              |
-| `Qwen3.5-35B-A3B`   | 35B / 3B                  | ?                 |
-| `Mixtral-8x7B-v0.1` | 46.7B / 12.9B             | ?                 |
+Perplexity measured on the WikiText2 dataset. Model size informs minimum VRAM requirement. Some weights (e.g. embeddings, attention matrices) are left in their original precision, due to their high sensitivity and small relative size.
+
+| Model               | Total / Active Parameters | PPL - FP16 | PPL - Quantized ↓ | Size - FP16 | Size - Quantized ↓ |
+| ------------------- | ------------------------- | ---------- | ----------------- | ----------- | ------------------ |
+| `Qwen1.5-MoE-A2.7B` | 14.3B / 2.7B              | 7.22       | 7.56              | 29 GB       | ?                  |
+| `Qwen3.5-35B-A3B`   | 35B / 3B                  | 6.26       | ?                 | 72 GB       | ?                  |
+| `Mixtral-8x7B-v0.1` | 46.7B / 12.9B             | ?          | ?                 | ?           | ?                  |
