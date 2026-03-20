@@ -1,10 +1,19 @@
 #include <cblas.h>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <random>
+
+using hrc = std::chrono::high_resolution_clock;
+
+static double elapsed_ms(hrc::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(hrc::now() - start).count();
+}
 
 namespace py = pybind11;
 
@@ -145,29 +154,6 @@ float square_l2(const float* a, const float* b, int d)
     return sum;
 }
 
-std::unique_ptr<int[]> weighted_kmeans_assign(const matview_2d& centroids, const matview_2d& points, const matview_2d& weights)
-{
-    int K = centroids.rows;
-    int D = points.cols;
-    int N = points.rows;
-
-    std::unique_ptr<int[]> assignments(new int[N]);
-
-    for (int n = 0; n < N; n++) {
-        float min_cost = INFINITY;
-
-        for (int i = 0; i < K; i++) {
-            float cost = weights(n, i) * square_l2(points[n], centroids[i], D);
-            if (cost < min_cost) {
-                min_cost = cost;
-                assignments[n] = i;
-            }
-        }
-    }
-
-    return assignments;
-}
-
 std::unique_ptr<int[]> unweighted_kmeans_assign(const matview_2d& centroids, const matview_2d& points)
 {
     int K = centroids.rows;
@@ -239,13 +225,13 @@ void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
     }
 }
 
-// precondition: weights are strictly positive
-owned_mat_2d weighted_kmeans_train(const matview_2d& data, const matview_2d& weights, int k, int niter)
+// Per-point weighted k-means. weights is a flat array of length N (one
+// positive weight per training point). Assignment is unweighted (per-point
+// scalars don't change the argmin); only the centroid update is weighted.
+owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights, int k, int niter)
 {
     int D = data.cols;
     int N = data.rows;
-
-    assert(weights.rows == N);
 
     auto centroids = owned_mat_2d(k, D);
     auto centroids_next = owned_mat_2d(k, D);
@@ -256,23 +242,19 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const matview_2d& wei
 
     for (int _ = 0; _ < niter; _++) {
         cv = centroids.view();
-        auto assignments = weighted_kmeans_assign(cv, data, weights);
+        auto assignments = unweighted_kmeans_assign(cv, data);
 
         centroids_next.view().inplace_zero();
         std::fill(weights_sum.get(), weights_sum.get() + k, 0.0f);
 
-        // do weight sum so we can / sum on the fly to avoid possible overflow
         for (int i = 0; i < N; i++) {
-            float weight = weights(i, assignments[i]);
-            weights_sum[assignments[i]] += weight;
+            weights_sum[assignments[i]] += weights[i];
         }
 
         for (int i = 0; i < N; i++) {
-            float weight = weights(i, assignments[i]);
-            float weight_sum = weights_sum[assignments[i]];
-
+            float ws = weights_sum[assignments[i]];
             for (int d = 0; d < D; d++) {
-                centroids_next.view()(assignments[i], d) += data(i, d) * weight / weight_sum;
+                centroids_next.view()(assignments[i], d) += data(i, d) * weights[i] / ws;
             }
         }
 
@@ -288,33 +270,39 @@ std::pair<std::vector<int>, owned_mat_2d> _vptq_quantize_one_expert(
     // assumed to be a copy that can be mutated in-place
     matview_2d& W_expert_quant,
     const matview_2d& Hinv,
-    const matview_2d& H_diag,
+    const float* h_diag,
     int V,
     int K,
     int kmeans_niter,
     int block_size)
 {
+    auto t_expert_start = hrc::now();
+
     int oc = W_expert_quant.rows;
     int ic = W_expert_quant.cols;
     int n_row_subvecs = oc / V;
+    int N = n_row_subvecs * ic;
 
-    // 1. weighted k-means training
-    // extract all V-length subvectors: for each input column, slice the oc
-    // rows into n_row_subvecs groups of V contiguous rows.
+    owned_mat_2d train_data(N, V);
 
-    owned_mat_2d train_data(n_row_subvecs * ic, V);
-
+    auto t0 = hrc::now();
+    auto point_weights = std::make_unique<float[]>(N);
     for (int col = 0; col < ic; col++) {
         for (int g = 0; g < n_row_subvecs; g++) {
             for (int v = 0; v < V; v++) {
                 train_data.view()(col * n_row_subvecs + g, v) = W_expert_quant(g * V + v, col);
             }
+            point_weights[col * n_row_subvecs + g] = h_diag[col];
         }
     }
+    fprintf(stderr, "[expert %d] subvec extraction: %.1f ms\n", ei, elapsed_ms(t0));
 
-    auto centroids = weighted_kmeans_train(train_data.view(), H_diag, K, kmeans_niter);
+    t0 = hrc::now();
+    auto centroids = weighted_kmeans_train(train_data.view(), point_weights.get(), K, kmeans_niter);
+    fprintf(stderr, "[expert %d] kmeans training (K=%d, niter=%d, N=%d, V=%d): %.1f ms\n",
+        ei, K, kmeans_niter, n_row_subvecs * ic, V, elapsed_ms(t0));
 
-    // 2. column-by-column error propagation
+    t0 = hrc::now();
     std::vector<int> indices(n_row_subvecs * ic);
 
     owned_mat_2d W1(oc, block_size);
@@ -388,6 +376,10 @@ std::pair<std::vector<int>, owned_mat_2d> _vptq_quantize_one_expert(
         }
     }
 
+    fprintf(stderr, "[expert %d] error propagation (%d blocks): %.1f ms\n",
+        ei, (ic + block_size - 1) / block_size, elapsed_ms(t0));
+    fprintf(stderr, "[expert %d] total: %.1f ms\n", ei, elapsed_ms(t_expert_start));
+
     return std::make_pair(std::move(indices), std::move(centroids));
 }
 
@@ -396,17 +388,22 @@ std::pair<std::vector<int>, owned_mat_2d> _vptq_quantize_one_expert(
 py::tuple vptq_quantize(
     py::array_t<float, py::array::c_style>& W_quant,
     py::array_t<float, py::array::c_style>& Hinv,
-    py::array_t<float, py::array::c_style>& H_diag,
+    py::array_t<float, py::array::c_style>& h_diag,
     int V,
     int K,
     int kmeans_niter,
     int block_size)
 {
-    auto W_quant_data = matview_2d::from_array_f32(W_quant);
-    auto Hinv_data = matview_2d::from_array_f32(Hinv);
-    auto H_diag_data = matview_2d::from_array_f32(H_diag);
+    auto t_total = hrc::now();
 
-    int n_experts = W_quant_data.rows;
+    assert(W_quant.ndim() == 3);
+    int n_experts = W_quant.shape(0);
+    auto Hinv_data = matview_2d::from_array_f32(Hinv);
+    assert(h_diag.ndim() == 1);
+    const float* h_diag_ptr = h_diag.data();
+
+    fprintf(stderr, "[vptq] quantizing %d experts (V=%d, K=%d, niter=%d, block=%d)\n",
+        n_experts, V, K, kmeans_niter, block_size);
 
     std::vector<py::array_t<float, py::array::c_style>> per_expert_weights;
 
@@ -422,8 +419,8 @@ py::tuple vptq_quantize(
 
         for (int ei = 0; ei < n_experts; ei++) {
             auto W_expert_quant = matview_2d::from_array_f32(per_expert_weights[ei]);
-            auto result = _vptq_quantize_one_expert(ei, W_expert_quant, Hinv_data, H_diag_data, V, K, kmeans_niter, block_size);
-            per_expert_results.push_back(std::move(result)); // needs move here?
+            auto result = _vptq_quantize_one_expert(ei, W_expert_quant, Hinv_data, h_diag_ptr, V, K, kmeans_niter, block_size);
+            per_expert_results.push_back(std::move(result));
         }
     }
 
@@ -456,6 +453,8 @@ py::tuple vptq_quantize(
             }
         }
     }
+
+    fprintf(stderr, "[vptq] total quantization: %.1f ms\n", elapsed_ms(t_total));
 
     return py::make_tuple(indices, codebooks);
 }
