@@ -1,8 +1,9 @@
+#include <algorithm>
 #include <cblas.h>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -104,6 +105,27 @@ struct matview_2d {
         size_t nbytes = static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(float);
         std::memmove(data, src.data, nbytes);
     }
+
+    // this += alpha * A * B
+    // this is (M x N), A is (M x K), B is (K x N)
+    void gemm(float alpha, const matview_2d& A, const matview_2d& B, float beta = 1.0f)
+    {
+        assert(rows == A.rows && cols == B.cols && A.cols == B.rows);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            rows, cols, A.cols,
+            alpha, A.data, A.cols,
+            B.data, B.cols,
+            beta, data, cols);
+    }
+
+    // this += alpha * x * y^T  (rank-1 update)
+    // x has length rows, y has length cols
+    void ger(float alpha, const float* x, int incx, const float* y, int incy)
+    {
+        cblas_sger(CblasRowMajor, rows, cols,
+            alpha, x, incx, y, incy,
+            data, cols);
+    }
 };
 
 struct owned_mat_2d {
@@ -154,7 +176,47 @@ float square_l2(const float* a, const float* b, int d)
     return sum;
 }
 
-std::unique_ptr<int[]> unweighted_kmeans_assign(const matview_2d& centroids, const matview_2d& points)
+template<int D>
+float square_l2_exact_d(const float* a, const float* b)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < D; i++) {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+template<int D>
+std::unique_ptr<int[]> unweighted_kmeans_assign_exact_d(const matview_2d& centroids, const matview_2d& points)
+{
+    int K = centroids.rows;
+    int N = points.rows;
+    assert(centroids.cols == D);
+    assert(points.cols == D);
+
+    std::unique_ptr<int[]> assignments(new int[N]);
+
+    for (int n = 0; n < N; n++) {
+        float min_cost = std::numeric_limits<float>::infinity();
+        int best_i = 0;
+        const float* point = points[n];
+
+        for (int i = 0; i < K; i++) {
+            float cost = square_l2_exact_d<D>(point, centroids[i]);
+            if (cost < min_cost) {
+                min_cost = cost;
+                best_i = i;
+            }
+        }
+
+        assignments[n] = best_i;
+    }
+
+    return assignments;
+}
+
+std::unique_ptr<int[]> unweighted_kmeans_assign_generic(const matview_2d& centroids, const matview_2d& points)
 {
     int K = centroids.rows;
     int N = points.rows;
@@ -163,18 +225,65 @@ std::unique_ptr<int[]> unweighted_kmeans_assign(const matview_2d& centroids, con
     std::unique_ptr<int[]> assignments(new int[N]);
 
     for (int n = 0; n < N; n++) {
-        float min_cost = INFINITY;
+        float min_cost = std::numeric_limits<float>::infinity();
+        int best_i = 0;
+        const float* point = points[n];
 
         for (int i = 0; i < K; i++) {
-            float cost = square_l2(points[n], centroids[i], D);
+            float cost = square_l2(point, centroids[i], D);
             if (cost < min_cost) {
                 min_cost = cost;
-                assignments[n] = i;
+                best_i = i;
             }
         }
+
+        assignments[n] = best_i;
     }
 
     return assignments;
+}
+
+std::unique_ptr<int[]> unweighted_kmeans_assign(const matview_2d& centroids, const matview_2d& points)
+{
+    int D = points.cols;
+    switch (D) {
+    case 1:
+        return unweighted_kmeans_assign_exact_d<1>(centroids, points);
+    case 2:
+        return unweighted_kmeans_assign_exact_d<2>(centroids, points);
+    case 3:
+        return unweighted_kmeans_assign_exact_d<3>(centroids, points);
+    case 4:
+        return unweighted_kmeans_assign_exact_d<4>(centroids, points);
+    case 5:
+        return unweighted_kmeans_assign_exact_d<5>(centroids, points);
+    case 6:
+        return unweighted_kmeans_assign_exact_d<6>(centroids, points);
+    case 7:
+        return unweighted_kmeans_assign_exact_d<7>(centroids, points);
+    case 8:
+        return unweighted_kmeans_assign_exact_d<8>(centroids, points);
+    case 9:
+        return unweighted_kmeans_assign_exact_d<9>(centroids, points);
+    case 10:
+        return unweighted_kmeans_assign_exact_d<10>(centroids, points);
+    case 11:
+        return unweighted_kmeans_assign_exact_d<11>(centroids, points);
+    case 12:
+        return unweighted_kmeans_assign_exact_d<12>(centroids, points);
+    case 13:
+        return unweighted_kmeans_assign_exact_d<13>(centroids, points);
+    case 14:
+        return unweighted_kmeans_assign_exact_d<14>(centroids, points);
+    case 15:
+        return unweighted_kmeans_assign_exact_d<15>(centroids, points);
+    case 16:
+        return unweighted_kmeans_assign_exact_d<16>(centroids, points);
+    default:
+        break;
+    }
+
+    return unweighted_kmeans_assign_generic(centroids, points);
 }
 
 void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
@@ -243,18 +352,32 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
     for (int _ = 0; _ < niter; _++) {
         cv = centroids.view();
         auto assignments = unweighted_kmeans_assign(cv, data);
+        auto centroids_next_view = centroids_next.view();
 
-        centroids_next.view().inplace_zero();
+        centroids_next_view.inplace_zero();
         std::fill(weights_sum.get(), weights_sum.get() + k, 0.0f);
 
         for (int i = 0; i < N; i++) {
-            weights_sum[assignments[i]] += weights[i];
+            int assignment = assignments[i];
+            float weight = weights[i];
+            weights_sum[assignment] += weight;
+            for (int d = 0; d < D; d++) {
+                centroids_next_view(assignment, d) += data(i, d) * weight;
+            }
         }
 
-        for (int i = 0; i < N; i++) {
-            float ws = weights_sum[assignments[i]];
-            for (int d = 0; d < D; d++) {
-                centroids_next.view()(assignments[i], d) += data(i, d) * weights[i] / ws;
+        for (int c = 0; c < k; c++) {
+            float ws = weights_sum[c];
+            if (ws > 0.0f) {
+                float inv_ws = 1.0f / ws;
+                for (int d = 0; d < D; d++) {
+                    centroids_next_view(c, d) *= inv_ws;
+                }
+            } else {
+                // Keep the previous centroid when a cluster receives no points.
+                for (int d = 0; d < D; d++) {
+                    centroids_next_view(c, d) = cv(c, d);
+                }
             }
         }
 
@@ -353,26 +476,23 @@ std::pair<std::vector<int>, owned_mat_2d> _vptq_quantize_one_expert(
             }
 
             if (j + 1 < count) {
-                // W1[:, j + 1 :] -= Err1[:, j] * Hinv1[j, j + 1 :]
-                for (int i = 0; i < oc; i++) {
-                    for (int k = j + 1; k < count; k++) {
-                        W1.view()(i, k) -= Err1.view()(i, j) * Hinv1.view()(j, k);
-                    }
-                }
+                // W1[:, j+1:] -= Err1[:, j] * Hinv1[j, j+1:]
+                int remaining = count - j - 1;
+                cblas_sger(CblasRowMajor, oc, remaining,
+                    -1.0f,
+                    &Err1.view()(0, j), count,   // x = Err1 column j, stride = count
+                    &Hinv1.view()(j, j + 1), 1,  // y = Hinv1 row j from j+1 onward
+                    &W1.view()(0, j + 1), count); // C = W1 from column j+1, lda = count
             }
         }
 
         if (i2 < ic) {
             // W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-            for (int i = 0; i < oc; i++) {
-                for (int m = 0; m < ic - i2; m++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < count; k++) {
-                        sum += Err1.view()(i, k) * Hinv(i1 + k, i2 + m);
-                    }
-                    W_expert_quant(i, i2 + m) -= sum;
-                }
-            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                oc, ic - i2, count,
+                -1.0f, Err1.view().data, Err1.view().cols,
+                &Hinv(i1, i2), Hinv.cols,
+                1.0f, &W_expert_quant(0, i2), W_expert_quant.cols);
         }
     }
 
@@ -440,7 +560,7 @@ py::tuple vptq_quantize(
     for (int ei = 0; ei < n_experts; ei++) {
         auto& result = per_expert_results[ei];
 
-        for (int i = 0; i < result.first.size(); i++) {
+        for (size_t i = 0; i < result.first.size(); i++) {
             indices_view(ei, i) = result.first[i];
         }
     }
