@@ -27,5 +27,5 @@ Perplexity measured on the WikiText2 dataset. Model size informs minimum VRAM re
 | Model               | Total / Active Parameters | PPL - FP16 | PPL - Quantized ↓ | Size - FP16 | Size - Quantized ↓ |
 | ------------------- | ------------------------- | ---------- | ----------------- | ----------- | ------------------ |
 | `Qwen1.5-MoE-A2.7B` | 14.3B / 2.7B              | 7.22       | 7.56              | 29 GB       | ?                  |
-| `Qwen3.5-35B-A3B`   | 35B / 3B                  | 6.26       | ?                 | 72 GB       | ?                  |
+| `Qwen3.5-35B-A3B`   | 35B / 3B                  | 7.17       | 8.08              | 67 GB       | 22.2 GB (~3x)      |
 | `Mixtral-8x7B-v0.1` | 46.7B / 12.9B             | ?          | ?                 | ?           | ?                  |
