@@ -22,8 +22,8 @@ from k2quant.util import get_calibration_data, evaluate_perplexity
 
 # -- Configuration --
 MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B"
-DEVICE = "cuda"
-CACHE_DIR = "/workspace/kbvq/hf_cache"
+DEVICE = "mps"
+CACHE_DIR = "./hf_cache"
 
 cfg = k2quant.QuantConfig(
     k_factor=1 / 8,

@@ -20,23 +20,31 @@ fi
 mkdir -p ../bin
 
 OUTPUT_NAME=../bin/vptq$(python3 -m pybind11 --extension-suffix)
-ASSEMBLY_NAME=../bin/vptq.S
+VPTQ_ASSEMBLY_NAME=../bin/vptq.S
+KMEANS_ASSEMBLY_NAME=../bin/kmeans.S
+COMMON_FLAGS=(-O3 -Wall -shared -std=c++17 -fPIC -march=native)
+SOURCES=(vptq.cpp kmeans.cpp)
 
 # if -a is passed, output the assembly instead of the binary
-if [[ "$1" == "-a" ]]; then
-    c++ -S -fverbose-asm -g -O3 -Wall -shared -std=c++17 -fPIC -march=native \
+if [[ "${1:-}" == "-a" ]]; then
+    c++ -S -fverbose-asm -g "${COMMON_FLAGS[@]}" \
         $(python3 -m pybind11 --includes) \
         "${BLAS_CFLAGS[@]}" \
         "${PLATFORM_FLAGS[@]}" \
         vptq.cpp \
-        "${BLAS_LDFLAGS[@]}" \
-        -o ${ASSEMBLY_NAME}
+        -o ${VPTQ_ASSEMBLY_NAME}
+    c++ -S -fverbose-asm -g "${COMMON_FLAGS[@]}" \
+        $(python3 -m pybind11 --includes) \
+        "${BLAS_CFLAGS[@]}" \
+        "${PLATFORM_FLAGS[@]}" \
+        kmeans.cpp \
+        -o ${KMEANS_ASSEMBLY_NAME}
 else
-    c++ -O3 -Wall -shared -std=c++17 -fPIC -march=native \
+    c++ "${COMMON_FLAGS[@]}" \
         $(python3 -m pybind11 --includes) \
         "${BLAS_CFLAGS[@]}" \
         "${PLATFORM_FLAGS[@]}" \
-        vptq.cpp \
+        "${SOURCES[@]}" \
         "${BLAS_LDFLAGS[@]}" \
         -o ${OUTPUT_NAME}
 fi

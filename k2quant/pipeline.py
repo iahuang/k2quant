@@ -49,8 +49,8 @@ def _collect_activations(
             batch = calib_data[i : i + batch_size].to(device)
             model(batch)
             batch_idx = i // batch_size
-            if batch_idx % 32 == 0:
-                log_fn(f"    Batch {batch_idx + 1}/{n_batches}")
+
+            log_fn(f"    Batch {batch_idx + 1}/{n_batches}")
 
     for h in hooks:
         h.remove()
