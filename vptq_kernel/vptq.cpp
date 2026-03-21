@@ -331,6 +331,112 @@ void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
     }
 }
 
+// Transposed centroid storage: (V, K) layout so that sweeps across K are contiguous
+struct centroids_transposed {
+    std::unique_ptr<float[]> data; // V * K floats
+    int V;
+    int K;
+
+    centroids_transposed(const matview_2d& centroids)
+        : data(std::make_unique<float[]>(centroids.cols * centroids.rows))
+        , V(centroids.cols)
+        , K(centroids.rows)
+    {
+        for (int k = 0; k < K; k++) {
+            for (int v = 0; v < V; v++) {
+                data[v * K + k] = centroids(k, v);
+            }
+        }
+    }
+
+    const float* component(int v) const { return data.get() + v * K; }
+};
+
+#include <immintrin.h>
+
+// AVX2 vectorized argmin over K values. K must be a multiple of 8.
+static int argmin_avx2(const float* dist, int K)
+{
+    __m256 min_vals = _mm256_loadu_ps(dist);
+    __m256i min_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    __m256i step = _mm256_set1_epi32(8);
+    __m256i cur_idx = min_idx;
+
+    for (int k = 8; k < K; k += 8) {
+        cur_idx = _mm256_add_epi32(cur_idx, step);
+        __m256 vals = _mm256_loadu_ps(dist + k);
+        __m256 mask = _mm256_cmp_ps(vals, min_vals, _CMP_LT_OS);
+        min_vals = _mm256_blendv_ps(min_vals, vals, mask);
+        min_idx = _mm256_blendv_epi8(min_idx, cur_idx,
+                                      _mm256_castps_si256(mask));
+    }
+
+    // horizontal reduction: 8 → 1
+    // swap high/low 128-bit lanes
+    __m128 lo = _mm256_castps256_ps128(min_vals);
+    __m128 hi = _mm256_extractf128_ps(min_vals, 1);
+    __m128i ilo = _mm256_castsi256_si128(min_idx);
+    __m128i ihi = _mm256_extracti128_si256(min_idx, 1);
+
+    __m128 mask4 = _mm_cmplt_ps(hi, lo);
+    lo = _mm_blendv_ps(lo, hi, mask4);
+    ilo = _mm_blendv_epi8(ilo, ihi, _mm_castps_si128(mask4));
+
+    // 4 → 2
+    __m128 shuf = _mm_movehdup_ps(lo);           // [1,1,3,3]
+    __m128i ishuf = _mm_shuffle_epi32(ilo, 0xB1); // [1,0,3,2]
+    __m128 mask2 = _mm_cmplt_ps(shuf, lo);
+    lo = _mm_blendv_ps(lo, shuf, mask2);
+    ilo = _mm_blendv_epi8(ilo, ishuf, _mm_castps_si128(mask2));
+
+    // 2 → 1
+    __m128 shuf2 = _mm_movehl_ps(lo, lo);         // [2,3,2,3]
+    __m128i ishuf2 = _mm_shuffle_epi32(ilo, 0x0E); // [2,3,_,_]
+    __m128 mask1 = _mm_cmplt_ps(shuf2, lo);
+    ilo = _mm_blendv_epi8(ilo, ishuf2, _mm_castps_si128(mask1));
+
+    return _mm_cvtsi128_si32(ilo);
+}
+
+void unweighted_kmeans_assign_transposed(
+    int* assignments,
+    const centroids_transposed& ct,
+    const matview_2d& points,
+    float* dist_buf) // preallocated, length K
+{
+    int N = points.rows;
+    int K = ct.K;
+    int V = ct.V;
+
+    for (int n = 0; n < N; n++) {
+        const float* x = points[n];
+
+        // first component: dist[k] = (x[0] - c0[k])^2
+        {
+            const float* c = ct.component(0);
+            float xv = x[0];
+            for (int k = 0; k < K; k++) {
+                float diff = xv - c[k];
+                dist_buf[k] = diff * diff;
+            }
+        }
+
+        // remaining components: dist[k] += (x[v] - cv[k])^2
+        for (int v = 1; v < V; v++) {
+            const float* c = ct.component(v);
+            float xv = x[v];
+            for (int k = 0; k < K; k++) {
+                float diff = xv - c[k];
+                dist_buf[k] += diff * diff;
+            }
+        }
+
+        // argmin
+
+        assignments[n] = argmin_avx2(dist_buf, K);
+    }
+}
+
 // Per-point weighted k-means. weights is a flat array of length N (one
 // positive weight per training point). Assignment is unweighted (per-point
 // scalars don't change the argmin); only the centroid update is weighted.
@@ -344,13 +450,16 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
     auto centroids_next = owned_mat_2d(k, D);
     auto weights_sum = std::make_unique<float[]>(k);
     auto assignments = std::make_unique<int[]>(N);
+    auto dist_buf = std::make_unique<float[]>(k);
 
     auto cv = centroids.view();
     kmeans_centroid_init(data, cv, k);
 
+    centroids_transposed ct(cv);
+
     for (int _ = 0; _ < niter; _++) {
         cv = centroids.view();
-        unweighted_kmeans_assign(assignments.get(), cv, data);
+        unweighted_kmeans_assign_transposed(assignments.get(), ct, data, dist_buf.get());
         auto centroids_next_view = centroids_next.view();
 
         centroids_next_view.inplace_zero();
@@ -388,6 +497,9 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
         }
 
         std::swap(centroids, centroids_next);
+
+        ct = centroids_transposed(centroids.view());
+        
         if (max_centroid_delta_sq <= kmeans_centroid_delta_tol_sq) {
             fprintf(stderr, "[weighted_kmeans_train] converged early after %d iterations\n", _);
             break;
@@ -526,7 +638,7 @@ py::tuple vptq_quantize(
     int block_size)
 {
     auto t_total = hrc::now();
-    constexpr int kVptqNumThreads = 24;
+    constexpr int kVptqNumThreads = 48;
 
     assert(W_quant.ndim() == 3);
     int n_experts = W_quant.shape(0);
