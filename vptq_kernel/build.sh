@@ -19,10 +19,24 @@ fi
 
 mkdir -p ../bin
 
-c++ -O3 -Wall -shared -std=c++17 -fPIC \
-    $(python3 -m pybind11 --includes) \
-    "${BLAS_CFLAGS[@]}" \
-    "${PLATFORM_FLAGS[@]}" \
-    vptq.cpp \
-    "${BLAS_LDFLAGS[@]}" \
-    -o ../bin/vptq$(python3 -m pybind11 --extension-suffix)
+OUTPUT_NAME=../bin/vptq$(python3 -m pybind11 --extension-suffix)
+ASSEMBLY_NAME=../bin/vptq.S
+
+# if -a is passed, output the assembly instead of the binary
+if [[ "$1" == "-a" ]]; then
+    c++ -S -fverbose-asm -g -O3 -Wall -shared -std=c++17 -fPIC -march=native \
+        $(python3 -m pybind11 --includes) \
+        "${BLAS_CFLAGS[@]}" \
+        "${PLATFORM_FLAGS[@]}" \
+        vptq.cpp \
+        "${BLAS_LDFLAGS[@]}" \
+        -o ${ASSEMBLY_NAME}
+else
+    c++ -O3 -Wall -shared -std=c++17 -fPIC -march=native \
+        $(python3 -m pybind11 --includes) \
+        "${BLAS_CFLAGS[@]}" \
+        "${PLATFORM_FLAGS[@]}" \
+        vptq.cpp \
+        "${BLAS_LDFLAGS[@]}" \
+        -o ${OUTPUT_NAME}
+fi

@@ -252,30 +252,14 @@ void unweighted_kmeans_assign(int* assignments, const matview_2d& centroids, con
         return unweighted_kmeans_assign_exact_d<3>(assignments, centroids, points);
     case 4:
         return unweighted_kmeans_assign_exact_d<4>(assignments, centroids, points);
-    case 5:
-        return unweighted_kmeans_assign_exact_d<5>(assignments, centroids, points);
-    case 6:
-        return unweighted_kmeans_assign_exact_d<6>(assignments, centroids, points);
-    case 7:
-        return unweighted_kmeans_assign_exact_d<7>(assignments, centroids, points);
     case 8:
         return unweighted_kmeans_assign_exact_d<8>(assignments, centroids, points);
-    case 9:
-        return unweighted_kmeans_assign_exact_d<9>(assignments, centroids, points);
-    case 10:
-        return unweighted_kmeans_assign_exact_d<10>(assignments, centroids, points);
-    case 11:
-        return unweighted_kmeans_assign_exact_d<11>(assignments, centroids, points);
-    case 12:
-        return unweighted_kmeans_assign_exact_d<12>(assignments, centroids, points);
-    case 13:
-        return unweighted_kmeans_assign_exact_d<13>(assignments, centroids, points);
-    case 14:
-        return unweighted_kmeans_assign_exact_d<14>(assignments, centroids, points);
-    case 15:
-        return unweighted_kmeans_assign_exact_d<15>(assignments, centroids, points);
     case 16:
         return unweighted_kmeans_assign_exact_d<16>(assignments, centroids, points);
+    case 32:
+        return unweighted_kmeans_assign_exact_d<32>(assignments, centroids, points);
+    case 64:
+        return unweighted_kmeans_assign_exact_d<64>(assignments, centroids, points);
     default:
         break;
     }
@@ -352,88 +336,106 @@ struct centroids_transposed {
     const float* component(int v) const { return data.get() + v * K; }
 };
 
-#include <immintrin.h>
-
-// AVX2 vectorized argmin over K values. K must be a multiple of 8.
-static int argmin_avx2(const float* dist, int K)
-{
-    __m256 min_vals = _mm256_loadu_ps(dist);
-    __m256i min_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    __m256i step = _mm256_set1_epi32(8);
-    __m256i cur_idx = min_idx;
-
-    for (int k = 8; k < K; k += 8) {
-        cur_idx = _mm256_add_epi32(cur_idx, step);
-        __m256 vals = _mm256_loadu_ps(dist + k);
-        __m256 mask = _mm256_cmp_ps(vals, min_vals, _CMP_LT_OS);
-        min_vals = _mm256_blendv_ps(min_vals, vals, mask);
-        min_idx = _mm256_blendv_epi8(min_idx, cur_idx,
-                                      _mm256_castps_si256(mask));
-    }
-
-    // horizontal reduction: 8 → 1
-    // swap high/low 128-bit lanes
-    __m128 lo = _mm256_castps256_ps128(min_vals);
-    __m128 hi = _mm256_extractf128_ps(min_vals, 1);
-    __m128i ilo = _mm256_castsi256_si128(min_idx);
-    __m128i ihi = _mm256_extracti128_si256(min_idx, 1);
-
-    __m128 mask4 = _mm_cmplt_ps(hi, lo);
-    lo = _mm_blendv_ps(lo, hi, mask4);
-    ilo = _mm_blendv_epi8(ilo, ihi, _mm_castps_si128(mask4));
-
-    // 4 → 2
-    __m128 shuf = _mm_movehdup_ps(lo);           // [1,1,3,3]
-    __m128i ishuf = _mm_shuffle_epi32(ilo, 0xB1); // [1,0,3,2]
-    __m128 mask2 = _mm_cmplt_ps(shuf, lo);
-    lo = _mm_blendv_ps(lo, shuf, mask2);
-    ilo = _mm_blendv_epi8(ilo, ishuf, _mm_castps_si128(mask2));
-
-    // 2 → 1
-    __m128 shuf2 = _mm_movehl_ps(lo, lo);         // [2,3,2,3]
-    __m128i ishuf2 = _mm_shuffle_epi32(ilo, 0x0E); // [2,3,_,_]
-    __m128 mask1 = _mm_cmplt_ps(shuf2, lo);
-    ilo = _mm_blendv_epi8(ilo, ishuf2, _mm_castps_si128(mask1));
-
-    return _mm_cvtsi128_si32(ilo);
-}
-
 void unweighted_kmeans_assign_transposed(
-    int* assignments,
+    int* __restrict__ assignments,
     const centroids_transposed& ct,
     const matview_2d& points,
-    float* dist_buf) // preallocated, length K
+    float* __restrict__ dist_buf) // now length K * BATCH
 {
     int N = points.rows;
     int K = ct.K;
     int V = ct.V;
+    constexpr int BATCH = 4;
 
-    for (int n = 0; n < N; n++) {
+    int n = 0;
+    for (; n + BATCH <= N; n += BATCH) {
+        float* d0 = dist_buf;
+        float* d1 = dist_buf + K;
+        float* d2 = dist_buf + 2 * K;
+        float* d3 = dist_buf + 3 * K;
+        const float* x0 = points[n];
+        const float* x1 = points[n + 1];
+        const float* x2 = points[n + 2];
+        const float* x3 = points[n + 3];
+
+        // first component
+        {
+            const float* c = ct.component(0);
+            float xv0 = x0[0], xv1 = x1[0], xv2 = x2[0], xv3 = x3[0];
+            for (int k = 0; k < K; k++) {
+                float cv = c[k];
+                float diff0 = xv0 - cv;
+                float diff1 = xv1 - cv;
+                float diff2 = xv2 - cv;
+                float diff3 = xv3 - cv;
+                d0[k] = diff0 * diff0;
+                d1[k] = diff1 * diff1;
+                d2[k] = diff2 * diff2;
+                d3[k] = diff3 * diff3;
+            }
+        }
+
+        // remaining components
+        for (int v = 1; v < V; v++) {
+            const float* c = ct.component(v);
+            float xv0 = x0[v], xv1 = x1[v], xv2 = x2[v], xv3 = x3[v];
+            for (int k = 0; k < K; k++) {
+                float cv = c[k];
+                float diff0 = xv0 - cv;
+                float diff1 = xv1 - cv;
+                float diff2 = xv2 - cv;
+                float diff3 = xv3 - cv;
+                d0[k] += diff0 * diff0;
+                d1[k] += diff1 * diff1;
+                d2[k] += diff2 * diff2;
+                d3[k] += diff3 * diff3;
+            }
+        }
+
+        // argmins
+        for (int b = 0; b < BATCH; b++) {
+            float* d = dist_buf + b * K;
+            float best = d[0];
+            int best_k = 0;
+            for (int k = 1; k < K; k++) {
+                if (d[k] < best) {
+                    best = d[k];
+                    best_k = k;
+                }
+            }
+            assignments[n + b] = best_k;
+        }
+    }
+
+    // tail
+    for (; n < N; n++) {
         const float* x = points[n];
-
-        // first component: dist[k] = (x[0] - c0[k])^2
+        float* d = dist_buf;
         {
             const float* c = ct.component(0);
             float xv = x[0];
             for (int k = 0; k < K; k++) {
                 float diff = xv - c[k];
-                dist_buf[k] = diff * diff;
+                d[k] = diff * diff;
             }
         }
-
-        // remaining components: dist[k] += (x[v] - cv[k])^2
         for (int v = 1; v < V; v++) {
             const float* c = ct.component(v);
             float xv = x[v];
             for (int k = 0; k < K; k++) {
                 float diff = xv - c[k];
-                dist_buf[k] += diff * diff;
+                d[k] += diff * diff;
             }
         }
-
-        // argmin
-
-        assignments[n] = argmin_avx2(dist_buf, K);
+        float best = d[0];
+        int best_k = 0;
+        for (int k = 1; k < K; k++) {
+            if (d[k] < best) {
+                best = d[k];
+                best_k = k;
+            }
+        }
+        assignments[n] = best_k;
     }
 }
 
@@ -499,7 +501,7 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
         std::swap(centroids, centroids_next);
 
         ct = centroids_transposed(centroids.view());
-        
+
         if (max_centroid_delta_sq <= kmeans_centroid_delta_tol_sq) {
             fprintf(stderr, "[weighted_kmeans_train] converged early after %d iterations\n", _);
             break;
@@ -638,7 +640,7 @@ py::tuple vptq_quantize(
     int block_size)
 {
     auto t_total = hrc::now();
-    constexpr int kVptqNumThreads = 48;
+    constexpr int vptq_num_threads = 48;
 
     assert(W_quant.ndim() == 3);
     int n_experts = W_quant.shape(0);
@@ -663,7 +665,7 @@ py::tuple vptq_quantize(
 
     {
         py::gil_scoped_release release;
-        int num_threads = std::min(kVptqNumThreads, n_experts);
+        int num_threads = std::min(vptq_num_threads, n_experts);
         std::atomic<int> next_ei(0);
         std::exception_ptr worker_error;
         std::mutex worker_error_mutex;
