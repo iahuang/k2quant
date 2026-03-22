@@ -13,14 +13,25 @@ diag(H_inv)), so their errors propagate to less important columns.
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
-import faiss
 import numpy as np
 import torch
 import torch.nn as nn
 
 from .config import QuantConfig
+
+_bin_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'bin'))
+if _bin_dir not in sys.path:
+    sys.path.insert(0, _bin_dir)
+
+try:
+    import vptq as _vptq
+except ImportError:
+    _vptq = None
 
 
 @dataclasses.dataclass
@@ -135,6 +146,96 @@ def _vptq_one_expert_row(args: tuple) -> tuple:
     return indices, centroids
 
 
+def _prepare_vq_inputs(
+    W_quant: torch.Tensor,
+    H: torch.Tensor,
+    cfg: QuantConfig,
+) -> tuple:
+    """Shared input preparation for both C++ and Python VQ paths.
+
+    Pads rows, computes Hinv, applies column ordering.
+
+    Returns:
+        (W_quant, Hinv_np, h_diag_np, oc_pad, oc_padded, ic_padded,
+         col_invperm, K, V)
+    """
+    n, oc, ic = W_quant.shape
+    K = cfg.codebook_size
+    V = cfg.vq_d
+
+    oc_pad = (V - oc % V) % V
+    if oc_pad > 0:
+        W_quant = nn.functional.pad(W_quant, (0, 0, 0, oc_pad))
+    oc_padded = oc + oc_pad
+    ic_padded = ic
+
+    damp = cfg.vptq_damp_percent * H.diagonal().mean()
+    H_damp = H + damp * torch.eye(ic, device=H.device, dtype=H.dtype)
+    H_inv = torch.linalg.inv(H_damp.double()).float()
+    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()
+
+    col_perm = torch.argsort(Hinv.diagonal())
+    col_invperm = torch.argsort(col_perm)
+    Hinv = Hinv[col_perm][:, col_perm]
+    W_quant = W_quant[:, :, col_perm]
+    h_diag_np = H.diagonal()[col_perm].cpu().float().numpy()
+    Hinv_np = Hinv.cpu().numpy()
+
+    return (W_quant, Hinv_np, h_diag_np, oc_pad, oc_padded, ic_padded,
+            col_invperm, K, V)
+
+
+def _vq_quantize_cpp(
+    W_quant: torch.Tensor,
+    Hinv_np: np.ndarray,
+    h_diag_np: np.ndarray,
+    V: int,
+    K: int,
+    cfg: QuantConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Call the C++ VPTQ kernel."""
+    n = W_quant.shape[0]
+    oc_padded = W_quant.shape[1]
+
+    W_np = np.ascontiguousarray(W_quant.cpu().float().numpy())
+    indices_np, codebooks_np = _vptq.vptq_quantize(
+        W_np, Hinv_np, h_diag_np,
+        V, K, cfg.vq_kmeans_niter, cfg.vptq_block_size,
+    )
+
+    n_row_subvecs = oc_padded // V
+    indices_np = indices_np.reshape(n, n_row_subvecs, -1)
+    codebooks_np = codebooks_np.reshape(n, K, V)
+    return indices_np, codebooks_np
+
+
+def _vq_quantize_python(
+    W_quant: torch.Tensor,
+    Hinv_np: np.ndarray,
+    h_diag_np: np.ndarray,
+    V: int,
+    K: int,
+    cfg: QuantConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pure-Python fallback using faiss k-means."""
+    import faiss
+
+    n = W_quant.shape[0]
+
+    work_items = []
+    for ei in range(n):
+        W_np = W_quant[ei].cpu().float().numpy()
+        work_items.append((W_np, Hinv_np, h_diag_np, V, K,
+                           cfg.vq_kmeans_niter, cfg.vptq_block_size))
+
+    with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
+        results = list(pool.map(_vptq_one_expert_row, work_items))
+
+    all_indices = [idx for idx, _ in results]
+    all_codebooks = [cb for _, cb in results]
+    return np.stack(all_indices), np.stack(all_codebooks)
+
+
 def vq_quantize(
     W_quant: torch.Tensor,
     H: torch.Tensor,
@@ -144,6 +245,8 @@ def vq_quantize(
     VPTQ-based vector quantization (paper-faithful row-axis mode).
 
     Hessian-weighted k-means + column-by-column error propagation.
+    Uses the compiled C++ kernel when available, otherwise falls back
+    to a pure-Python implementation with faiss.
 
     Args:
         W_quant: Weight residuals after IDRE.
@@ -156,69 +259,26 @@ def vq_quantize(
         VQResult with all indices, codebooks, and column permutation info.
     """
     n, oc, ic = W_quant.shape
-    K = cfg.codebook_size
-    V = cfg.vq_d  # subvector dimension = V rows
 
-    # ── Padding: pad oc to be divisible by V ──────────────────────────────
-    oc_pad = (V - oc % V) % V
-    ic_pad = 0
-    if oc_pad > 0:
-        W_quant = nn.functional.pad(W_quant, (0, 0, 0, oc_pad))  # pad rows
-    oc_padded = oc + oc_pad
-    ic_padded = ic
+    (W_quant, Hinv_np, h_diag_np, oc_pad, oc_padded, ic_padded,
+     col_invperm, K, V) = _prepare_vq_inputs(W_quant, H, cfg)
 
-    # ── Compute upper Cholesky of H^{-1} (shared across all experts) ────
-    damp = cfg.vptq_damp_percent * H.diagonal().mean()
-    H_damp = H + damp * torch.eye(ic, device=H.device, dtype=H.dtype)
-    H_inv = torch.linalg.inv(H_damp.double()).float()
-    Hinv = torch.linalg.cholesky(H_inv.double(), upper=True).float()
-
-    # ── Column ordering ──────────────────────────────────────────────────
-    # Sort columns by ascending diag(H_inv): process easy/low-sensitivity
-    # columns first. Their quantization errors propagate to columns that
-    # are less affected by perturbation, while high-sensitivity columns
-    # are quantized last with the benefit of all prior error corrections.
-    col_perm = torch.argsort(Hinv.diagonal())
-    col_invperm = torch.argsort(col_perm)
-    Hinv = Hinv[col_perm][:, col_perm]
-    W_quant = W_quant[:, :, col_perm]
-    h_diag_np = H.diagonal()[col_perm].cpu().float().numpy()
-
-    Hinv_np = Hinv.cpu().numpy()
-
-    # ── Dispatch per-expert VPTQ to thread pool ──────────────────────────
-    work_items = []
-    for ei in range(n):
-        W_np = W_quant[ei].cpu().float().numpy()
-        work_items.append(
-            (
-                W_np,
-                Hinv_np,
-                h_diag_np,
-                V,
-                K,
-                cfg.vq_kmeans_niter,
-                cfg.vptq_block_size,
-            )
-        )
-
-    with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
-        results = list(pool.map(_vptq_one_expert_row, work_items))
-
-    # ── Collect results ──────────────────────────────────────────────────
-    all_indices = []
-    all_codebooks = []
-
-    for idx, cb in results:
-        all_indices.append(torch.from_numpy(idx))
-        all_codebooks.append(torch.from_numpy(cb).half())
+    t0 = time.time()
+    if _vptq is not None:
+        indices_np, codebooks_np = _vq_quantize_cpp(
+            W_quant, Hinv_np, h_diag_np, V, K, cfg)
+    else:
+        indices_np, codebooks_np = _vq_quantize_python(
+            W_quant, Hinv_np, h_diag_np, V, K, cfg)
+    print(f"[vq_quantize] {n} experts, V={V}, K={K}: {time.time() - t0:.1f}s"
+          f" ({'C++' if _vptq else 'Python'})")
 
     return VQResult(
-        main_indices=torch.stack(all_indices),
-        main_codebooks=torch.stack(all_codebooks),
+        main_indices=torch.from_numpy(indices_np.copy()),
+        main_codebooks=torch.from_numpy(codebooks_np.copy()).half(),
         oc_pad=oc_pad,
         oc_padded=oc_padded,
-        ic_pad=ic_pad,
+        ic_pad=0,
         ic_padded=ic_padded,
         col_invperm=col_invperm,
     )

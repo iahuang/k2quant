@@ -1,0 +1,1 @@
+C++ module implementing the VPTQ algorithm on CPU.
