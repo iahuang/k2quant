@@ -1,21 +1,3 @@
-"""QuantizableExperts: drop-in replacement for HF fused experts with BCOS.
-
-Replaces HuggingFace's experts sub-module within an MoE block, preserving
-the parent block's routing and shared expert code unchanged. This avoids
-compound float16 divergence from reimplementing the full MoE forward.
-
-The forward signature matches HF's experts calling convention:
-    experts(hidden_states, top_k_index, top_k_weights) -> final_hidden_states
-
-Standardized weight layout:
-    gate_up_proj: (num_experts, 2*intermediate_size, hidden_size)
-    down_proj:    (num_experts, hidden_size, intermediate_size)
-
-Subclasses implement from_hf_module() to copy weights from a specific
-HF architecture into this layout. The dispatch loop and BCOS application
-are shared across all MoE architectures.
-"""
-
 from __future__ import annotations
 
 from typing import Callable, Optional
@@ -28,19 +10,6 @@ from .projection import BCOSLayout
 
 
 class QuantizableExperts(nn.Module):
-    """Drop-in replacement for HF fused experts with native BCOS support.
-
-    After quantization, BCOS correction params are set directly on this
-    module. The forward() checks for their presence and applies them
-    inline — no forward patching required.
-
-    Attributes:
-        num_experts: Number of experts.
-        hidden_size: Model hidden dimension (input to gate_up, output of down).
-        intermediate_size: Expert intermediate dimension.
-        act_fn: Activation function applied to the gate output (e.g. F.silu).
-    """
-
     def __init__(
         self,
         num_experts: int,
@@ -81,11 +50,7 @@ class QuantizableExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Expert dispatch with optional BCOS correction.
-
-        Matches HF's experts.forward() calling convention so the parent
-        MoE block's routing and shared expert code remain unchanged.
-
+        """
         Args:
             hidden_states: Flattened input activations. (num_tokens, hidden_size).
             top_k_index: Expert indices per token. (num_tokens, top_k). int64.
@@ -150,6 +115,7 @@ class QuantizableExperts(nn.Module):
         device: str,
     ) -> None:
         """Set BCOS correction parameters from quantization results."""
+        
         gate_up_layout = self.get_gate_up_bcos_layout()
         if len(gate_up_layout.names) == 2:
             self.bcos_scale_gate = gate_up_bcos[gate_up_layout.names[0]][0].to(device)
@@ -195,18 +161,10 @@ class QuantizableExperts(nn.Module):
         device: Optional[torch.device | str] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> QuantizableExperts:
-        """Create a QuantizableExperts by copying weights from an HF MoE block.
+        """
+        Adapter method to convert HuggingFace modules into a QuantizableExperts module.
 
-        Subclasses must override this to handle architecture-specific
-        weight names and layouts.
-
-        Args:
-            hf_moe_block: The HuggingFace MoE block containing experts.
-            device: Target device for the new module's parameters.
-            dtype: Target dtype for the new module's parameters.
-
-        Returns:
-            A new QuantizableExperts with weights copied from the HF experts.
+        Must be implemented by subclasses.
         """
         raise NotImplementedError(
             f"{cls.__name__} must implement from_hf_module() to convert "
@@ -217,14 +175,9 @@ class QuantizableExperts(nn.Module):
     def get_routing_info(
         hf_moe_block: nn.Module,
     ) -> tuple[torch.Tensor, int]:
-        """Return routing info for down_proj calibration.
+        """
+        Return routing info for down_proj calibration.
 
         Subclasses must override this.
-
-        Args:
-            hf_moe_block: The HuggingFace MoE block.
-
-        Returns:
-            (router_weight, top_k) tuple.
         """
         raise NotImplementedError

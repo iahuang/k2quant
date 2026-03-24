@@ -14,25 +14,6 @@ def get_calibration_data(
     split: str = "train",
     cache_dir: str | None = None,
 ) -> torch.Tensor:
-    """Load and tokenize calibration data from a HuggingFace text dataset.
-
-    Streams and shuffles documents, tokenizes each individually (preserving
-    natural token boundaries), and packs tokens into non-overlapping sequences
-    of length `seqlen`. Only downloads as much data as needed.
-
-    Args:
-        tokenizer: Any HuggingFace tokenizer (model-agnostic).
-        nsamples: Number of calibration sequences to sample.
-        seqlen: Token length per sample.
-        seed: Random seed for reproducible sample selection.
-        dataset_name: HuggingFace dataset identifier.
-        dataset_config: Dataset configuration name.
-        split: Dataset split to use.
-        cache_dir: Optional HuggingFace cache directory.
-
-    Returns:
-        Token IDs tensor. Shape: (nsamples, seqlen). int64, CPU.
-    """
     print(f"  Loading calibration data: {nsamples} samples, seqlen={seqlen}")
     dataset = load_dataset(
         dataset_name,
@@ -88,27 +69,6 @@ def evaluate_perplexity(
     max_chunks: int | None = None,
     log_fn: Callable[[str], None] | None = None,
 ) -> float:
-    """Evaluate perplexity of a causal language model on a text dataset.
-
-    Splits the test set into non-overlapping chunks of `seqlen` tokens,
-    computes cross-entropy loss on each, and returns exp(mean(losses)).
-
-    Args:
-        model: Any HuggingFace CausalLM (model-agnostic).
-        tokenizer: Corresponding tokenizer.
-        seqlen: Evaluation sequence length.
-        dataset_name: HuggingFace dataset identifier.
-        dataset_config: Dataset configuration name.
-        split: Dataset split to evaluate on.
-        device: Device for evaluation ("cuda", "cpu", etc.).
-        cache_dir: Optional HuggingFace cache directory.
-        max_chunks: If set, evaluate only this many chunks (for quick tests).
-        log_fn: Optional callback for progress logging.
-
-    Returns:
-        Perplexity (float). Lower is better. Computed as
-        exp(mean(cross_entropy_per_chunk)).
-    """
     if log_fn is None:
         log_fn = print
 

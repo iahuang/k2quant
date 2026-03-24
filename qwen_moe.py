@@ -1,11 +1,3 @@
-"""Qwen1.5-MoE-A2.7B: 2-bit quantization with k2quant.
-
-End-to-end example that quantizes all MoE expert layers using the
-IDRE + VPTQ + BCOS pipeline, then evaluates WikiText2 perplexity.
-
-Result: PPL ~ 7.56 at 2-bit (vs 6.71 FP16 baseline).
-"""
-
 import os
 import sys
 

@@ -1,13 +1,3 @@
-"""QwenExperts: QuantizableExperts for Qwen1.5-MoE models.
-
-The only model-specific code is from_hf_module() and get_routing_info(),
-which know how to extract weights and routing from Qwen's HF MoE block:
-    - experts.gate_up_proj -> gate_up_proj (already fused)
-    - experts.down_proj -> down_proj
-    - gate.weight -> router (for down_proj calibration routing)
-    - gate.top_k -> top_k
-"""
-
 from __future__ import annotations
 
 from typing import Optional

@@ -1,15 +1,3 @@
-"""
-Vector Quantization (VQ) implementing VPTQ (Liu et al., 2024).
-
-Channel-independent second-order optimization: subvectors span V contiguous
-output rows for each input column. Each column is fully quantized before
-error propagates to the next, so every centroid is chosen on fully-corrected
-weights. This is faithful to Algorithm 1 in the VPTQ paper.
-
-Column ordering: low-sensitivity columns are processed first (ascending
-diag(H_inv)), so their errors propagate to less important columns.
-"""
-
 from __future__ import annotations
 
 import dataclasses

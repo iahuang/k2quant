@@ -1,9 +1,3 @@
-"""Per-projection quantization: IDRE + VPTQ + BCOS in one call.
-
-Combines w_quantize_and_reconstruct and bcos into a single function,
-with support for split BCOS correction across sub-projections.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -16,11 +10,9 @@ from .quant import w_quantize_and_reconstruct
 
 @dataclasses.dataclass
 class BCOSLayout:
-    """Describes how to split a weight matrix for independent BCOS correction.
-
+    """
     For fused projections (e.g., gate_up_proj), BCOS must be applied
-    independently to each sub-projection because they have different
-    output distributions (gate → SiLU, up → linear).
+    independently to each sub-projection.
 
     For unfused projections, use a single split covering the whole oc
     dimension — BCOS is computed once over the entire matrix.
@@ -49,7 +41,8 @@ class BCOSLayout:
 
 @dataclasses.dataclass
 class ProjectionResult:
-    """Result of quantizing one projection.
+    """
+    Result of quantizing one projection.
 
     Attributes:
         W_vq: Reconstructed quantized weight. (n_experts, oc, ic). float32.
@@ -67,7 +60,8 @@ def quantize_projection(
     cfg: QuantConfig,
     bcos_layout: BCOSLayout,
 ) -> ProjectionResult:
-    """Quantize a single projection: IDRE + VPTQ + BCOS.
+    """
+    Quantize a single projection: IDRE + VPTQ + BCOS.
 
     Args:
         W_orig: Original weight matrices. (n_experts, oc, ic). float32.

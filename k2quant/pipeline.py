@@ -21,11 +21,8 @@ def _collect_activations(
     batch_size: int,
     log_fn: Callable[[str], None],
 ) -> dict[int, list[torch.Tensor]]:
-    """Collect MoE block input activations through unmodified HF forward.
-
-    Hooks are placed on the MoE blocks (not the experts sub-module) so
-    that calibration data flows through HF's original routing and shared
-    expert code — no compound divergence from our reimplementation.
+    """
+    Collect MoE block input activations through unmodified HF forward.
     """
     block_inputs: dict[int, list[torch.Tensor]] = {}
     hooks = []
@@ -71,12 +68,8 @@ def quantize_model(
     batch_size: int = 2,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Quantize all MoE expert layers of a model in-place.
-
-    Collects calibration activations through the unmodified HF forward
-    (preserving original routing and shared expert behavior), then swaps
-    only the experts sub-module with a QuantizableExperts that applies
-    BCOS corrections.
+    """
+    Quantize all MoE expert layers of a model in-place.
 
     Args:
         model: The HuggingFace model to quantize (modified in-place).
@@ -117,7 +110,6 @@ def quantize_model(
         )
         hidden_size = qe.hidden_size
 
-        # Prepare activations: concatenate, reshape, subsample
         acts = torch.cat(block_inputs[li], dim=0).reshape(-1, hidden_size)
         del block_inputs[li]
         if acts.shape[0] > max_calib_tokens:

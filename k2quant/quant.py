@@ -10,11 +10,10 @@ def w_quantize_and_reconstruct(
     X_calib: torch.Tensor,
     cfg: QuantConfig,
 ) -> torch.Tensor:
-    """Full IDRE + VPTQ pipeline, returning reconstructed weights.
+    """IDRE + VPTQ pipeline, returning reconstructed weights.
 
     Convenience wrapper around quantize_weight_compressed() that immediately
-    reconstructs the full weight. Use this when you only need the quantized
-    weight for in-memory inference and don't need to export.
+    reconstructs the full weight.
 
     Args:
         W: Expert weight matrices.
@@ -36,16 +35,8 @@ def w_quantize(
     X_calib: torch.Tensor,
     cfg: QuantConfig,
 ) -> WeightQuantization:
-    """Full IDRE + VPTQ pipeline, returning the compressed representation.
-
-    Use this when you need to export the quantized model (e.g. to safetensors).
-    Call .reconstruct() on the result to get the full weight for inference,
-    or .to_tensors(prefix) to serialize for storage.
-
-    Steps:
-    1. IDRE: extract shared component W_share (kept at full precision).
-    2. Compute Hessian H = X^T X / n from calibration activations.
-    3. VPTQ: quantize residual (W - W_share) with Hessian-weighted k-means, error propagation and column ordering.
+    """
+    IDRE + VPTQ pipeline, returning the compressed representation.
 
     Args:
         W: Expert weight matrices.
@@ -81,13 +72,6 @@ def w_quantize(
 
 @dataclasses.dataclass
 class WeightQuantization:
-    """All compressed data for one quantized weight tensor.
-
-    Holds every artifact produced by the IDRE + VPTQ + BCOS pipeline,
-    sufficient to both reconstruct the full-precision weight and to
-    serialize the compressed representation for storage.
-    """
-
     # IDRE shared component — kept at full precision
     w_share: torch.Tensor
     """Shared low-rank component. Shape: (n_experts, oc, ic). float16."""

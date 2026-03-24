@@ -1,5 +1,3 @@
-"""Quantization configuration for the IDRE + VPTQ + BCOS pipeline."""
-
 from __future__ import annotations
 
 import dataclasses

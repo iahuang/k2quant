@@ -10,15 +10,6 @@ def bcos(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute BCOS affine correction factors.
 
-    Computes per-channel affine correction factors that align the quantized
-    output distribution to the original full-precision output. Applied after
-    quantization to reduce the distributional shift caused by weight rounding.
-
-    For fused projections (e.g., Qwen's gate_up_proj), BCOS must be applied
-    to each sub-projection independently — the gate and up halves have
-    different output distributions, and applying a single correction to
-    the fused output corrupts the gate/up interaction.
-
     Finds scale s and bias b such that:
         y_corrected = (1 + s) * y_vq + b ≈ y_orig
 
@@ -60,11 +51,6 @@ def klt_decomposition(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     KLT (Karhunen-Loeve Transform) of input activations.
 
-    Computes the input coherence basis from the sample covariance of X.
-    This aligns expert weights with the input's principal directions,
-    so that SVD on the aligned weights captures shared structure that
-    matters most for output quality.
-
     Args:
         X: Calibration activations. (b, ic) for b samples.
 
@@ -101,13 +87,6 @@ def idre(
 ) -> torch.Tensor:
     """Input-Driven Redundancy Elimination (IDRE).
 
-    Extracts the shared low-rank component across all experts by:
-    1. KLT-aligning weights with input activation statistics
-    2. SVD on stacked aligned weights to find cross-expert shared structure
-    3. Truncating to rank k = int(ic * k_factor)
-
-    The residual W_quant = W - W_share is what gets quantized by VPTQ.
-
     Args:
         X: Calibration activations. (b, ic).
         W: Expert weight matrices. (n_experts, oc, ic).
@@ -122,23 +101,18 @@ def idre(
     n, oc, ic = W.shape
     k = max(1, int(ic * k_factor))
 
-    # Step 1: KLT decomposition of input activations
     U_X, U_X_inv = klt_decomposition(X)  # both (ic, ic)
 
-    # Step 2: Project all expert weights into KLT-aligned space
     W_hat = W @ U_X  # (n, oc, ic)
 
-    # Step 3: Stack all experts and find shared structure via SVD
     W_bar = W_hat.reshape(-1, ic)  # (n*oc, ic)
     U, S, Vh = torch.linalg.svd(W_bar.T, full_matrices=False)
     # U: (ic, min(ic, n*oc)), S: (min(...),), Vh: (min(...), n*oc)
 
-    # Step 4: Truncate to rank k
     U_k = U[:, :k]  # (ic, k)
     S_k = torch.diag(S[:k])  # (k, k)
     V_k = (Vh[:k, :].T @ S_k).reshape(n, oc, k)  # (n, oc, k)
 
-    # Step 5: Project back to weight space
     # W_share^(i) = V_k^(i) @ U_k^T @ U_X_inv
     W_share = torch.einsum("nok,jk,ji->noi", V_k, U_k, U_X_inv)  # (n, oc, ic)
 
