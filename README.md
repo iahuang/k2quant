@@ -6,7 +6,6 @@ k2quant extends the original findings of KBVQ-MoE by swapping the VQ step for a 
 
 - Propagates errors over the columns of the weight matrix sorted by the inverse of the Hessian. This is a unique contribution of k2quant and empirically improves perplexity.
 - Removes the residual VQ step from the pipeline, as this was found to contribute diminishing returns.
-- Weighted K-means algorithm is approximated by oversampling proportional to the Hessian diagonal. This is a technical limitation due to the use of faiss for k-means, which does not support weighted k-means.
 
 ## Comparison to Published Results
 
@@ -33,5 +32,4 @@ Perplexity measured on the WikiText2 dataset. Model size informs minimum VRAM re
 ## Next Steps
 
 - [ ] Add support for more models. Add support for memory/disk offloading to allow for quantization of models larger than VRAM budget.
-- [ ] (In progress) Finish C++ based implementation of CPU-bound VPTQ, removing reliance on fiass + avoiding Python-loops-calling-Numpy routines that aren't easily vectorized.
 - [ ] Perform more extensive studies: impact of residual propagation, sub-2 bit quantization, and more.

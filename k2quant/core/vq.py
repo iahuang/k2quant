@@ -16,11 +16,10 @@ _bin_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 
 if _bin_dir not in sys.path:
     sys.path.insert(0, _bin_dir)
 
-try:
-    import vptq as _vptq
-except ImportError:
-    _vptq = None
+import vptq as _vptq
+# _vptq = None
 
+import faiss
 
 @dataclasses.dataclass
 class VQResult:
@@ -65,32 +64,30 @@ def _vptq_one_expert_row(args: tuple) -> tuple:
         args: Tuple of (W_np, Hinv_np, h_diag_np, V, K, niter, block_size).
 
     Returns:
-        Tuple of (indices, centroids).
+        Tuple of (indices, centroids, kmeans_train_seconds, errprop_seconds).
     """
     W_np, Hinv_np, h_diag_np, V, K, niter, block_size = args
     oc, ic = W_np.shape  # single expert: (oc_padded, ic)
     n_row_subvecs = oc // V
 
     # ── 1. Hessian-weighted k-means ──────────────────────────────────────
-    # Approximate weighted k-means via oversampling: columns with higher
-    # diag(H) values contribute more training vectors to the codebook.
-    if h_diag_np.sum() > 0:
-        norm_w = h_diag_np / (h_diag_np.mean() + 1e-10)
-        repeat_counts = np.clip(np.round(norm_w).astype(int), 1, 4)
-    else:
-        repeat_counts = np.ones(ic, dtype=int)
-
     train_parts = []
     for col in range(ic):
         col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)  # (n_row_subvecs, V)
-        for _ in range(repeat_counts[col]):
-            train_parts.append(col_subvecs)
+        train_parts.append(col_subvecs)
     train_data = np.vstack(train_parts).astype(np.float32)
+    if h_diag_np.sum() > 0:
+        train_weights = np.repeat(h_diag_np.astype(np.float32), n_row_subvecs)
+    else:
+        train_weights = np.ones(train_data.shape[0], dtype=np.float32)
 
     km = faiss.Kmeans(V, K, niter=niter, verbose=False, gpu=False)
-    km.train(train_data)
+    t_km0 = time.perf_counter()
+    km.train(train_data, weights=train_weights)
+    t_kmeans = time.perf_counter() - t_km0
     centroids = km.centroids.copy().astype(np.float32)  # (K, V)
 
+    t_ep0 = time.perf_counter()
     search_index = faiss.IndexFlatL2(V)
     search_index.add(centroids)
 
@@ -130,8 +127,9 @@ def _vptq_one_expert_row(args: tuple) -> tuple:
 
         if i2 < ic:
             W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    t_errprop = time.perf_counter() - t_ep0
 
-    return indices, centroids
+    return indices, centroids, t_kmeans, t_errprop
 
 
 def _prepare_vq_inputs(
@@ -206,7 +204,7 @@ def _vq_quantize_python(
     cfg: QuantConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pure-Python fallback using faiss k-means."""
-    import faiss
+
 
     n = W_quant.shape[0]
 
@@ -219,9 +217,65 @@ def _vq_quantize_python(
     with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
         results = list(pool.map(_vptq_one_expert_row, work_items))
 
-    all_indices = [idx for idx, _ in results]
-    all_codebooks = [cb for _, cb in results]
+    all_indices = [r[0] for r in results]
+    all_codebooks = [r[1] for r in results]
+    total_kmeans = sum(r[2] for r in results)
+    total_errprop = sum(r[3] for r in results)
+    print(
+        f"[_vq_quantize_python] k-means train (sum over threads): {total_kmeans:.3f}s, "
+        f"error propagation (sum over threads): {total_errprop:.3f}s"
+    )
     return np.stack(all_indices), np.stack(all_codebooks)
+
+
+def _vq_quantize_hybrid(
+    W_quant: torch.Tensor,
+    Hinv_np: np.ndarray,
+    h_diag_np: np.ndarray,
+    V: int,
+    K: int,
+    cfg: QuantConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hybrid: FAISS k-means in Python + C++ error propagation."""
+    n = W_quant.shape[0]
+    oc_padded = W_quant.shape[1]
+    ic = W_quant.shape[2]
+    n_row_subvecs = oc_padded // V
+
+    def train_one(ei: int) -> np.ndarray:
+        W_np = W_quant[ei].cpu().float().numpy()
+        if h_diag_np.sum() > 0:
+            norm_w = h_diag_np / (h_diag_np.mean() + 1e-10)
+            repeat_counts = np.clip(np.round(norm_w).astype(int), 1, 4)
+        else:
+            repeat_counts = np.ones(ic, dtype=int)
+
+        train_parts = []
+        for col in range(ic):
+            col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)
+            for _ in range(repeat_counts[col]):
+                train_parts.append(col_subvecs)
+        train_data = np.vstack(train_parts).astype(np.float32)
+
+        km = faiss.Kmeans(V, K, niter=cfg.vq_kmeans_niter, verbose=False, gpu=False)
+        km.train(train_data)
+        return km.centroids.copy().astype(np.float32)  # (K, V)
+
+    t_km = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
+        all_centroids = list(pool.map(train_one, range(n)))
+    print(f"[_vq_quantize_hybrid] k-means: {time.perf_counter() - t_km:.3f}s")
+
+    centroids_np = np.stack(all_centroids)  # (n, K, V)
+    centroids_flat = np.ascontiguousarray(centroids_np.reshape(n * K, V))
+
+    t_ep = time.perf_counter()
+    W_np = np.ascontiguousarray(W_quant.cpu().float().numpy())
+    indices_flat = _vptq.vptq_errprop(W_np, Hinv_np, centroids_flat, V, K, cfg.vptq_block_size)
+    print(f"[_vq_quantize_hybrid] error propagation: {time.perf_counter() - t_ep:.3f}s")
+
+    indices_np = indices_flat.reshape(n, n_row_subvecs, ic)
+    return indices_np, centroids_np
 
 
 def vq_quantize(
@@ -252,14 +306,19 @@ def vq_quantize(
      col_invperm, K, V) = _prepare_vq_inputs(W_quant, H, cfg)
 
     t0 = time.time()
-    if _vptq is not None:
+    if _vptq is not None and hasattr(_vptq, 'vptq_errprop'):
+        indices_np, codebooks_np = _vq_quantize_hybrid(
+            W_quant, Hinv_np, h_diag_np, V, K, cfg)
+        backend = 'hybrid'
+    elif _vptq is not None:
         indices_np, codebooks_np = _vq_quantize_cpp(
             W_quant, Hinv_np, h_diag_np, V, K, cfg)
+        backend = 'C++'
     else:
         indices_np, codebooks_np = _vq_quantize_python(
             W_quant, Hinv_np, h_diag_np, V, K, cfg)
-    print(f"[vq_quantize] {n} experts, V={V}, K={K}: {time.time() - t0:.1f}s"
-          f" ({'C++' if _vptq else 'Python'})")
+        backend = 'Python'
+    print(f"[vq_quantize] {n} experts, V={V}, K={K}: {time.time() - t0:.1f}s ({backend})")
 
     return VQResult(
         main_indices=torch.from_numpy(indices_np.copy()),
