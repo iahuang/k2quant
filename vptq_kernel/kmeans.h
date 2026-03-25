@@ -130,4 +130,3 @@ struct owned_mat_2d {
 
 void unweighted_kmeans_assign(int* assignments, const matview_2d& centroids, const matview_2d& points);
 owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights, int k, int niter);
-owned_mat_2d kmeanspp_init(const matview_2d& data, int k);

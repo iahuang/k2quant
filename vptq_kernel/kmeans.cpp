@@ -337,15 +337,6 @@ void unweighted_kmeans_assign(int* assignments, const matview_2d& centroids, con
     return unweighted_kmeans_assign_generic(assignments, centroids, points);
 }
 
-owned_mat_2d kmeanspp_init(const matview_2d& data, int k)
-{
-    int D = data.cols;
-    auto centroids = owned_mat_2d(k, D);
-    auto cv = centroids.view();
-    kmeans_centroid_init(data, cv, k);
-    return centroids;
-}
-
 owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights, int k, int niter)
 {
     int D = data.cols;

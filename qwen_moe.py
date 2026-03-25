@@ -1,7 +1,6 @@
 import os
 import sys
 
-os.environ["OMP_NUM_THREADS"] = "1"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
@@ -24,7 +23,6 @@ cfg = k2quant.QuantConfig(
     vq_kmeans_niter=20,
     vptq_block_size=128,
     vptq_damp_percent=0.01,
-    vq_num_threads=24,
     seed=42,
 )
 

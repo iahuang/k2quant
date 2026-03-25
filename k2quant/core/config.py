@@ -30,9 +30,6 @@ class QuantConfig:
             Prevents singular Hessian when some input features have
             near-zero variance. Added as damp * I before inversion.
 
-        vq_num_threads: CPU threads for parallel per-expert k-means.
-            Set OMP_NUM_THREADS=1 before importing faiss to prevent
-            nested OpenMP parallelism (O(n_threads^2) threads).
         seed: Random seed for k-means initialization and data sampling.
     """
 
@@ -42,7 +39,6 @@ class QuantConfig:
     vq_kmeans_niter: int = 20
     vptq_block_size: int = 128
     vptq_damp_percent: float = 0.01
-    vq_num_threads: int = 24
     seed: int = 42
 
     @property
