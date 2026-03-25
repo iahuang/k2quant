@@ -239,7 +239,7 @@ std::vector<int> _vptq_errprop_one_expert(
         }
     }
 
-    fprintf(stderr, "[expert %d] error propagation: %.1f ms\n", ei, elapsed_ms(t0));
+    // fprintf(stderr, "[expert %d] error propagation: %.1f ms\n", ei, elapsed_ms(t0));
 
     return indices;
 }

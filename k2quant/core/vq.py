@@ -242,9 +242,10 @@ def _vq_quantize_hybrid(
     ic = W_quant.shape[2]
     n_row_subvecs = oc_padded // V
 
-    def train_one(ei: int) -> np.ndarray:
+    def train_one(ei: int) -> tuple[np.ndarray, float, float, float, float]:
         W_np = W_quant[ei].cpu().float().numpy()
 
+        t0 = time.perf_counter()
         train_parts = []
         for col in range(ic):
             col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)
@@ -255,16 +256,29 @@ def _vq_quantize_hybrid(
             train_weights = np.repeat(h_diag_np.astype(np.float32), n_row_subvecs)
         else:
             train_weights = np.ones(train_data.shape[0], dtype=np.float32)
+        t_prep = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         init_centroids = _vptq.kmeans_pp_init(train_data, K)
+        t_init = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         km = faiss.Kmeans(V, K, niter=cfg.vq_kmeans_niter, verbose=False, gpu=False)
         km.train(train_data, weights=train_weights, init_centroids=init_centroids)
-        return km.centroids.copy().astype(np.float32)  # (K, V)
+        t_train = time.perf_counter() - t0
+
+        return km.centroids.copy().astype(np.float32), t_prep, t_init, t_train
 
     t_km = time.perf_counter()
     with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
-        all_centroids = list(pool.map(train_one, range(n)))
-    print(f"[_vq_quantize_hybrid] k-means: {time.perf_counter() - t_km:.3f}s")
+        results = list(pool.map(train_one, range(n)))
+    all_centroids = [r[0] for r in results]
+    avg_prep = sum(r[1] for r in results) / n
+    avg_init = sum(r[2] for r in results) / n
+    avg_train = sum(r[3] for r in results) / n
+    print(f"[_vq_quantize_hybrid] k-means: {time.perf_counter() - t_km:.3f}s "
+          f"(per-expert avg: prep={avg_prep:.3f}s, kmeans++_init={avg_init:.3f}s, "
+          f"faiss_train={avg_train:.3f}s)")
 
     centroids_np = np.stack(all_centroids)  # (n, K, V)
     centroids_flat = np.ascontiguousarray(centroids_np.reshape(n * K, V))
