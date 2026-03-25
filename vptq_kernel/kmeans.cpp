@@ -76,6 +76,8 @@ void unweighted_kmeans_assign_generic(int* assignments, const matview_2d& centro
     }
 }
 
+} // namespace
+
 void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
 {
     int D = data.cols;
@@ -123,6 +125,8 @@ void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
         }
     }
 }
+
+namespace {
 
 struct centroids_transposed {
     std::unique_ptr<float[]> data;

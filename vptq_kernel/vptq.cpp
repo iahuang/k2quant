@@ -461,10 +461,32 @@ py::tuple vptq_quantize(
     return py::make_tuple(indices, codebooks);
 }
 
+// K-means++ initialization.
+// data: (N, D) float32 C-contiguous
+// Returns: (K, D) float32 initial centroids
+py::array_t<float, py::array::c_style>
+kmeans_pp_init(
+    py::array_t<float, py::array::c_style>& data,
+    int K)
+{
+    assert(data.ndim() == 2);
+    int N = data.shape(0);
+    int D = data.shape(1);
+
+    py::array_t<float, py::array::c_style> result({ static_cast<ssize_t>(K), static_cast<ssize_t>(D) });
+    auto data_view = matview_2d(data.mutable_data(), N, D);
+    auto result_view = matview_2d(result.mutable_data(), K, D);
+
+    kmeans_centroid_init(data_view, result_view, K);
+
+    return result;
+}
+
 PYBIND11_MODULE(vptq, m)
 {
     m.doc() = "VPTQ quantization kernel";
 
     m.def("vptq_quantize", &vptq_quantize, "Quantize a weight matrix using VPTQ");
     m.def("vptq_errprop", &vptq_errprop, "Error propagation with pre-computed centroids");
+    m.def("kmeans_pp_init", &kmeans_pp_init, "K-means++ centroid initialization");
 }
