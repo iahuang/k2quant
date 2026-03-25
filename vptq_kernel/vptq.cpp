@@ -472,10 +472,14 @@ kmeanspp_init_py(
 {
     assert(data.ndim() == 2);
     auto data_view = matview_2d::from_array_f32(data);
-
-    owned_mat_2d centroids = kmeanspp_init(data_view, k);
-
     int D = data.shape(1);
+
+    owned_mat_2d centroids(0, 0);
+    {
+        py::gil_scoped_release release;
+        centroids = kmeanspp_init(data_view, k);
+    }
+
     py::array_t<float, py::array::c_style> result({ static_cast<ssize_t>(k), static_cast<ssize_t>(D) });
     auto result_view = result.mutable_unchecked<2>();
     auto cv = centroids.view();
