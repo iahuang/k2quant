@@ -76,8 +76,69 @@ void unweighted_kmeans_assign_generic(int* assignments, const matview_2d& centro
     }
 }
 
+template <int D>
+void kmeans_centroid_init_exact_d(const matview_2d& data, matview_2d& centroids, int k)
+{
+    int N = data.rows;
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> first_dist(0, N - 1);
+
+    int first_idx = first_dist(rng);
+    for (int d = 0; d < D; d++) {
+        centroids(0, d) = data(first_idx, d);
+    }
+
+    auto min_dists = std::make_unique<float[]>(N);
+
+    for (int c = 1; c < k; c++) {
+        float total = 0.0f;
+        const float* last_centroid = centroids[c - 1];
+        for (int i = 0; i < N; i++) {
+            float d2 = square_l2_exact_d<D>(data[i], last_centroid);
+            min_dists[i] = (c == 1) ? d2 : std::min(min_dists[i], d2);
+            total += min_dists[i];
+        }
+
+        if (total <= 0.0f) {
+            for (int d = 0; d < D; d++) {
+                centroids(c, d) = data(first_dist(rng), d);
+            }
+            continue;
+        }
+
+        std::uniform_real_distribution<float> uniform(0.0f, total);
+        float r = uniform(rng);
+        float cumsum = 0.0f;
+        int selected = N - 1;
+        for (int i = 0; i < N; i++) {
+            cumsum += min_dists[i];
+            if (cumsum >= r) {
+                selected = i;
+                break;
+            }
+        }
+
+        for (int d = 0; d < D; d++) {
+            centroids(c, d) = data(selected, d);
+        }
+    }
+}
+
 void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
 {
+    switch (data.cols) {
+    case 1: return kmeans_centroid_init_exact_d<1>(data, centroids, k);
+    case 2: return kmeans_centroid_init_exact_d<2>(data, centroids, k);
+    case 3: return kmeans_centroid_init_exact_d<3>(data, centroids, k);
+    case 4: return kmeans_centroid_init_exact_d<4>(data, centroids, k);
+    case 8: return kmeans_centroid_init_exact_d<8>(data, centroids, k);
+    case 16: return kmeans_centroid_init_exact_d<16>(data, centroids, k);
+    case 32: return kmeans_centroid_init_exact_d<32>(data, centroids, k);
+    case 64: return kmeans_centroid_init_exact_d<64>(data, centroids, k);
+    default: break;
+    }
+
     int D = data.cols;
     int N = data.rows;
 
@@ -93,8 +154,9 @@ void kmeans_centroid_init(const matview_2d& data, matview_2d& centroids, int k)
 
     for (int c = 1; c < k; c++) {
         float total = 0.0f;
+        const float* last_centroid = centroids[c - 1];
         for (int i = 0; i < N; i++) {
-            float d2 = square_l2(data[i], centroids[c - 1], D);
+            float d2 = square_l2(data[i], last_centroid, D);
             min_dists[i] = (c == 1) ? d2 : std::min(min_dists[i], d2);
             total += min_dists[i];
         }
