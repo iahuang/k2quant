@@ -461,10 +461,37 @@ py::tuple vptq_quantize(
     return py::make_tuple(indices, codebooks);
 }
 
+// KMeans++ initialization wrapper.
+// data: (N, D) float32 C-contiguous
+// k: number of centroids
+// Returns: (k, D) float32 C-contiguous
+py::array_t<float, py::array::c_style>
+kmeanspp_init_py(
+    py::array_t<float, py::array::c_style>& data,
+    int k)
+{
+    assert(data.ndim() == 2);
+    auto data_view = matview_2d::from_array_f32(data);
+
+    owned_mat_2d centroids = kmeanspp_init(data_view, k);
+
+    int D = data.shape(1);
+    py::array_t<float, py::array::c_style> result({ static_cast<ssize_t>(k), static_cast<ssize_t>(D) });
+    auto result_view = result.mutable_unchecked<2>();
+    auto cv = centroids.view();
+    for (int i = 0; i < k; i++) {
+        for (int d = 0; d < D; d++) {
+            result_view(i, d) = cv(i, d);
+        }
+    }
+    return result;
+}
+
 PYBIND11_MODULE(vptq, m)
 {
     m.doc() = "VPTQ quantization kernel";
 
     m.def("vptq_quantize", &vptq_quantize, "Quantize a weight matrix using VPTQ");
     m.def("vptq_errprop", &vptq_errprop, "Error propagation with pre-computed centroids");
+    m.def("kmeanspp_init", &kmeanspp_init_py, "KMeans++ initialization");
 }

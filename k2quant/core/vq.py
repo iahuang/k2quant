@@ -256,8 +256,10 @@ def _vq_quantize_hybrid(
         else:
             train_weights = np.ones(train_data.shape[0], dtype=np.float32)
 
+        init_centroids = _vptq.kmeanspp_init(train_data, K)
+
         km = faiss.Kmeans(V, K, niter=cfg.vq_kmeans_niter, verbose=False, gpu=False)
-        km.train(train_data, weights=train_weights)
+        km.train(train_data, weights=train_weights, init_centroids=init_centroids)
         return km.centroids.copy().astype(np.float32)  # (K, V)
 
     t_km = time.perf_counter()
