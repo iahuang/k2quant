@@ -242,15 +242,14 @@ def _vq_quantize_hybrid(
     ic = W_quant.shape[2]
     n_row_subvecs = oc_padded // V
 
-    def train_one(ei: int) -> tuple[np.ndarray, float, float, float, float]:
+    def train_one(ei: int) -> tuple[np.ndarray, float, float, float]:
         W_np = W_quant[ei].cpu().float().numpy()
 
         t0 = time.perf_counter()
-        train_parts = []
-        for col in range(ic):
-            col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)
-            train_parts.append(col_subvecs)
-        train_data = np.vstack(train_parts).astype(np.float32)
+        # W_np is (oc_padded, ic) -> reshape to (n_row_subvecs, V, ic)
+        # -> transpose to (ic, n_row_subvecs, V) -> reshape to (ic * n_row_subvecs, V)
+        train_data = W_np.reshape(n_row_subvecs, V, ic).transpose(2, 0, 1).reshape(-1, V)
+        train_data = np.ascontiguousarray(train_data, dtype=np.float32)
 
         if h_diag_np.sum() > 0:
             train_weights = np.repeat(h_diag_np.astype(np.float32), n_row_subvecs)
