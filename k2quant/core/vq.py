@@ -236,48 +236,35 @@ def _vq_quantize_hybrid(
     K: int,
     cfg: QuantConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Hybrid: FAISS k-means (k-means++ init) + C++ error propagation."""
+    """Hybrid: FAISS k-means in Python + C++ error propagation."""
     n = W_quant.shape[0]
     oc_padded = W_quant.shape[1]
     ic = W_quant.shape[2]
     n_row_subvecs = oc_padded // V
 
-    def train_one(ei: int) -> tuple[np.ndarray, float, float, float]:
+    def train_one(ei: int) -> np.ndarray:
         W_np = W_quant[ei].cpu().float().numpy()
-
-        t0 = time.perf_counter()
-        # W_np is (oc_padded, ic) -> reshape to (n_row_subvecs, V, ic)
-        # -> transpose to (ic, n_row_subvecs, V) -> reshape to (ic * n_row_subvecs, V)
-        train_data = W_np.reshape(n_row_subvecs, V, ic).transpose(2, 0, 1).reshape(-1, V)
-        train_data = np.ascontiguousarray(train_data, dtype=np.float32)
-
         if h_diag_np.sum() > 0:
-            train_weights = np.repeat(h_diag_np.astype(np.float32), n_row_subvecs)
+            norm_w = h_diag_np / (h_diag_np.mean() + 1e-10)
+            repeat_counts = np.clip(np.round(norm_w).astype(int), 1, 4)
         else:
-            train_weights = np.ones(train_data.shape[0], dtype=np.float32)
-        t_prep = time.perf_counter() - t0
+            repeat_counts = np.ones(ic, dtype=int)
 
-        t0 = time.perf_counter()
-        init_centroids = _vptq.kmeans_pp_init(train_data, K)
-        t_init = time.perf_counter() - t0
+        train_parts = []
+        for col in range(ic):
+            col_subvecs = W_np[:, col].reshape(n_row_subvecs, V)
+            for _ in range(repeat_counts[col]):
+                train_parts.append(col_subvecs)
+        train_data = np.vstack(train_parts).astype(np.float32)
 
-        t0 = time.perf_counter()
         km = faiss.Kmeans(V, K, niter=cfg.vq_kmeans_niter, verbose=False, gpu=False)
-        km.train(train_data, weights=train_weights, init_centroids=init_centroids)
-        t_train = time.perf_counter() - t0
-
-        return km.centroids.copy().astype(np.float32), t_prep, t_init, t_train
+        km.train(train_data)
+        return km.centroids.copy().astype(np.float32)  # (K, V)
 
     t_km = time.perf_counter()
     with ThreadPoolExecutor(max_workers=cfg.vq_num_threads) as pool:
-        results = list(pool.map(train_one, range(n)))
-    all_centroids = [r[0] for r in results]
-    avg_prep = sum(r[1] for r in results) / n
-    avg_init = sum(r[2] for r in results) / n
-    avg_train = sum(r[3] for r in results) / n
-    print(f"[_vq_quantize_hybrid] k-means: {time.perf_counter() - t_km:.3f}s "
-          f"(per-expert avg: prep={avg_prep:.3f}s, kmeans++_init={avg_init:.3f}s, "
-          f"faiss_train={avg_train:.3f}s)")
+        all_centroids = list(pool.map(train_one, range(n)))
+    print(f"[_vq_quantize_hybrid] k-means: {time.perf_counter() - t_km:.3f}s")
 
     centroids_np = np.stack(all_centroids)  # (n, K, V)
     centroids_flat = np.ascontiguousarray(centroids_np.reshape(n * K, V))
