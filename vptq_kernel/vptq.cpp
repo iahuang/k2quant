@@ -1,4 +1,5 @@
 #include "kmeans.h"
+#include "pcores.h"
 
 #include <algorithm>
 #include <atomic>
@@ -172,7 +173,7 @@ py::tuple vptq_quantize(
     int block_size)
 {
     auto t_total = hrc::now();
-    constexpr int vptq_num_threads = 24;
+    int vptq_num_threads = physical_cores();
 
     assert(W_quant.ndim() == 3);
     int n_experts = W_quant.shape(0);

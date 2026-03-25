@@ -23,7 +23,7 @@ OUTPUT_NAME=../bin/vptq$(python3 -m pybind11 --extension-suffix)
 VPTQ_ASSEMBLY_NAME=../bin/vptq.S
 KMEANS_ASSEMBLY_NAME=../bin/kmeans.S
 COMMON_FLAGS=(-O3 -Wall -shared -std=c++17 -fPIC -march=native)
-SOURCES=(vptq.cpp kmeans.cpp)
+SOURCES=(vptq.cpp kmeans.cpp pcores.cpp)
 
 # if -a is passed, output the assembly instead of the binary
 if [[ "${1:-}" == "-a" ]]; then
@@ -39,6 +39,12 @@ if [[ "${1:-}" == "-a" ]]; then
         "${PLATFORM_FLAGS[@]}" \
         kmeans.cpp \
         -o ${KMEANS_ASSEMBLY_NAME}
+    c++ -S -fverbose-asm -g "${COMMON_FLAGS[@]}" \
+        $(python3 -m pybind11 --includes) \
+        "${BLAS_CFLAGS[@]}" \
+        "${PLATFORM_FLAGS[@]}" \
+        pcores.cpp \
+        -o ${PCORES_ASSEMBLY_NAME}
 else
     c++ "${COMMON_FLAGS[@]}" \
         $(python3 -m pybind11 --includes) \
