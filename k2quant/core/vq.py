@@ -236,7 +236,7 @@ def _vq_quantize_hybrid(
     K: int,
     cfg: QuantConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Hybrid: FAISS k-means (k-means++ init) + C++ error propagation."""
+    """Hybrid: FAISS k-means + C++ error propagation."""
     n = W_quant.shape[0]
     oc_padded = W_quant.shape[1]
     ic = W_quant.shape[2]
@@ -256,9 +256,8 @@ def _vq_quantize_hybrid(
         else:
             train_weights = np.ones(train_data.shape[0], dtype=np.float32)
 
-        init_centroids = _vptq.kmeans_pp_init(train_data, K)
         km = faiss.Kmeans(V, K, niter=cfg.vq_kmeans_niter, verbose=False, gpu=False)
-        km.train(train_data, weights=train_weights, init_centroids=init_centroids)
+        km.train(train_data, weights=train_weights)
         return km.centroids.copy().astype(np.float32)  # (K, V)
 
     t_km = time.perf_counter()
