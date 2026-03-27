@@ -67,7 +67,7 @@ def quantize_model(
     max_calib_tokens: int = 4096,
     batch_size: int = 2,
     log_fn: Optional[Callable[[str], None]] = None,
-) -> None:
+) -> dict[str, torch.Tensor]:
     """
     Quantize all MoE expert layers of a model in-place.
 
@@ -83,6 +83,10 @@ def quantize_model(
         max_calib_tokens: Maximum calibration tokens per block.
         batch_size: Batch size for calibration forward passes.
         log_fn: Optional progress logger.
+
+    Returns:
+        A flat dict mapping tensor names to CPU tensors for all quantized
+        expert projections, suitable for safetensors serialization.
     """
     if log_fn is None:
         log_fn = print
@@ -98,6 +102,7 @@ def quantize_model(
     # Step 2: Swap experts and quantize layer by layer
     log_fn("  Quantizing layers...")
     t_start = time.time()
+    all_compressed: dict[str, torch.Tensor] = {}
 
     for li in range(num_layers):
         t0 = time.time()
@@ -167,6 +172,10 @@ def quantize_model(
         qe.down_proj = nn.Parameter(d_result.W_vq.half().to(device))
         qe.set_bcos_params(gu_result.bcos_params, d_result.bcos_params, device)
 
+        # Collect compressed tensors (CPU) before freeing results
+        all_compressed.update(gu_result.wq.to_tensors(f"layers.{li}.gate_up"))
+        all_compressed.update(d_result.wq.to_tensors(f"layers.{li}.down"))
+
         # Replace only the experts sub-module on the HF MoE block
         moe_block.experts = qe
 
@@ -182,3 +191,5 @@ def quantize_model(
     del block_inputs
     gc.collect()
     torch.cuda.empty_cache()
+
+    return all_compressed
