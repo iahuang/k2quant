@@ -17,7 +17,7 @@ DEVICE = "cuda"
 CACHE_DIR = "./hf_cache"
 
 cfg = k2quant.QuantConfig(
-    k_factor=1 / 8,
+    k_factor=1 / 128,
     vq_bits=2,
     vq_d=4,
     vq_kmeans_niter=20,
@@ -76,7 +76,6 @@ def main():
     )
     print(f"\n{'=' * 70}")
     print(f"  WikiText2 PPL (2-bit, seqlen=4096): {ppl:.2f}")
-    print(f"  Baseline: FP16 -> 6.71  |  Paper 2-bit -> 9.61")
     print(f"{'=' * 70}")
 
 
