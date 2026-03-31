@@ -74,6 +74,7 @@ std::pair<std::vector<int>, owned_mat_2d> _vptq_quantize_one_expert(
             for (int v = 0; v < V; v++) {
                 train_data.view()(col * n_row_subvecs + g, v) = W_expert_quant(g * V + v, col);
             }
+            // the weight for this point is the diagonal element of the Hessian for the corresponding column
             point_weights[col * n_row_subvecs + g] = h_diag[col];
         }
     }
