@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import torch
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import k2quant
@@ -15,6 +16,7 @@ from k2quant.util import get_calibration_data, evaluate_perplexity
 MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B"
 DEVICE = "cuda"
 CACHE_DIR = "./hf_cache"
+OUTPUT_DIR = "./qwen_moe_2bit"
 
 cfg = k2quant.QuantConfig(
     k_factor=1 / 128,
@@ -29,6 +31,10 @@ cfg = k2quant.QuantConfig(
 os.environ["HF_HOME"] = CACHE_DIR
 
 
+def _tensor_bytes(t: torch.Tensor) -> int:
+    return t.nelement() * t.element_size()
+
+
 def main():
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -37,7 +43,7 @@ def main():
     print("k2quant: 2-bit Quantization of Qwen1.5-MoE-A2.7B")
     print("=" * 70)
 
-    print("\n[1/4] Loading tokenizer...")
+    print("\n[1/5] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
         cache_dir=CACHE_DIR,
@@ -47,12 +53,12 @@ def main():
     if not tokenizer.is_fast:
         raise RuntimeError(f"{MODEL_NAME} did not load a fast tokenizer")
 
-    print("\n[2/4] Loading calibration data...")
+    print("\n[2/5] Loading calibration data...")
     calib_data = get_calibration_data(
         tokenizer, nsamples=256, seqlen=4096, seed=cfg.seed, cache_dir=CACHE_DIR
     )
 
-    print("\n[3/4] Loading and quantizing model...")
+    print("\n[3/5] Loading and quantizing model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         dtype=torch.float16,
@@ -62,15 +68,60 @@ def main():
     )
     model.eval()
 
-    k2quant.quantize_model(
+    # Measure original expert weight sizes before quantization
+    orig_expert_bytes = 0
+    num_layers = model.config.num_hidden_layers
+    for li in range(num_layers):
+        moe_block = model.model.layers[li].mlp
+        for p in moe_block.experts.parameters():
+            orig_expert_bytes += _tensor_bytes(p)
+
+    compressed_tensors = k2quant.quantize_model(
         model, calib_data, cfg,
         QwenExperts,
         get_moe_block=lambda m, i: m.model.layers[i].mlp,
-        num_layers=model.config.num_hidden_layers,
+        num_layers=num_layers,
         device=DEVICE, max_calib_tokens=4096, batch_size=2,
     )
 
-    print("\n[4/4] Evaluating WikiText2 perplexity...")
+    print("\n[4/5] Saving quantized safetensors...")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Collect non-expert parameters (embeddings, attention, norms, routers)
+    non_expert_tensors = {}
+    for name, param in model.state_dict().items():
+        # Skip expert weights — they're replaced by compressed tensors
+        if ".experts." in name:
+            continue
+        non_expert_tensors[name] = param.contiguous().cpu()
+
+    # Merge non-expert params with compressed expert tensors
+    all_tensors = {}
+    all_tensors.update(non_expert_tensors)
+    all_tensors.update(compressed_tensors)
+
+    output_path = os.path.join(OUTPUT_DIR, "model.safetensors")
+    save_file(all_tensors, output_path)
+
+    # Compute sizes
+    non_expert_bytes = sum(_tensor_bytes(t) for t in non_expert_tensors.values())
+    compressed_bytes = sum(_tensor_bytes(t) for t in compressed_tensors.values())
+    total_orig_bytes = orig_expert_bytes + non_expert_bytes
+    total_quant_bytes = compressed_bytes + non_expert_bytes
+    file_bytes = os.path.getsize(output_path)
+
+    print(f"  Saved to: {output_path}")
+    print(f"\n  --- Size Breakdown ---")
+    print(f"  Original expert weights:    {orig_expert_bytes / 1e9:.2f} GB")
+    print(f"  Compressed expert weights:  {compressed_bytes / 1e9:.2f} GB")
+    print(f"  Non-expert parameters:      {non_expert_bytes / 1e9:.2f} GB")
+    print(f"  ---")
+    print(f"  Original total (params):    {total_orig_bytes / 1e9:.2f} GB")
+    print(f"  Quantized total (params):   {total_quant_bytes / 1e9:.2f} GB")
+    print(f"  Reduction:                  {(1 - total_quant_bytes / total_orig_bytes) * 100:.1f}%")
+    print(f"  Output file size:           {file_bytes / 1e9:.2f} GB")
+
+    print("\n[5/5] Evaluating WikiText2 perplexity...")
     ppl = evaluate_perplexity(
         model, tokenizer, seqlen=4096, device=DEVICE, cache_dir=CACHE_DIR
     )

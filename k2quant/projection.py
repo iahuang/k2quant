@@ -5,7 +5,7 @@ import dataclasses
 import torch
 
 from .core import QuantConfig, bcos
-from .quant import w_quantize_and_reconstruct
+from .quant import w_quantize, WeightQuantization
 
 
 @dataclasses.dataclass
@@ -52,6 +52,8 @@ class ProjectionResult:
 
     W_vq: torch.Tensor
     bcos_params: dict[str, tuple[torch.Tensor, torch.Tensor]]
+    wq: WeightQuantization = None
+    """Compressed quantized weight data for serialization."""
 
 
 def quantize_projection(
@@ -71,9 +73,11 @@ def quantize_projection(
             BCOS correction per sub-projection.
 
     Returns:
-        ProjectionResult with quantized weights and BCOS correction factors.
+        ProjectionResult with quantized weights, BCOS correction factors,
+        and the compressed WeightQuantization for serialization.
     """
-    W_vq = w_quantize_and_reconstruct(W_orig, X_calib, cfg)
+    wq = w_quantize(W_orig, X_calib, cfg)
+    W_vq = wq.reconstruct().to(W_orig.device)
 
     if sum(bcos_layout.split_sizes) != W_orig.shape[1]:
         raise ValueError(
@@ -90,4 +94,7 @@ def quantize_projection(
         bcos_params[name] = (s, b)
         offset += size
 
-    return ProjectionResult(W_vq=W_vq, bcos_params=bcos_params)
+    wq.bcos_scale = torch.cat([s for s, _ in bcos_params.values()], dim=1)
+    wq.bcos_bias = torch.cat([b for _, b in bcos_params.values()], dim=1)
+
+    return ProjectionResult(W_vq=W_vq, bcos_params=bcos_params, wq=wq)

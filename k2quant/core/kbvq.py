@@ -84,7 +84,7 @@ def idre(
     X: torch.Tensor,
     W: torch.Tensor,
     k_factor: float = 1 / 8,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Input-Driven Redundancy Elimination (IDRE).
 
     Args:
@@ -93,9 +93,9 @@ def idre(
         k_factor: Rank fraction. k = int(ic * k_factor).
 
     Returns:
-        W_share: Shared weight component. (n_experts, oc, ic).
-            Same dtype/device as W.
-            Full precision — not quantized.
+        V_k: Per-expert coefficients. (n_experts, oc, k). Same dtype/device as W.
+        basis: Shared low-rank basis. (k, ic). Same dtype/device as W.
+            Reconstruct via: W_share = V_k @ basis
     """
 
     n, oc, ic = W.shape
@@ -113,7 +113,7 @@ def idre(
     S_k = torch.diag(S[:k])  # (k, k)
     V_k = (Vh[:k, :].T @ S_k).reshape(n, oc, k)  # (n, oc, k)
 
-    # W_share^(i) = V_k^(i) @ U_k^T @ U_X_inv
-    W_share = torch.einsum("nok,jk,ji->noi", V_k, U_k, U_X_inv)  # (n, oc, ic)
+    # basis = U_k^T @ U_X_inv — shared across all experts
+    basis = U_k.T @ U_X_inv  # (k, ic)
 
-    return W_share
+    return V_k, basis

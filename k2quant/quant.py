@@ -12,7 +12,7 @@ def w_quantize_and_reconstruct(
 ) -> torch.Tensor:
     """IDRE + VPTQ pipeline, returning reconstructed weights.
 
-    Convenience wrapper around quantize_weight_compressed() that immediately
+    Convenience wrapper around w_quantize() that immediately
     reconstructs the full weight.
 
     Args:
@@ -46,13 +46,14 @@ def w_quantize(
         cfg: Quantization configuration (QuantConfig).
 
     Returns:
-        QuantizedWeight holding all compressed data. BCOS fields are None —
+        WeightQuantization holding all compressed data. BCOS fields are None —
         call compute_bcos_params() separately and assign to .bcos_scale/.bcos_bias.
     """
     n, oc, ic = W.shape
 
-    # Step 1: IDRE — extract shared low-rank component
-    W_share = idre(X_calib, W, k_factor=cfg.k_factor)  # (n, oc, ic)
+    # Step 1: IDRE — extract shared low-rank component in factored form
+    V_k, basis = idre(X_calib, W, k_factor=cfg.k_factor)
+    W_share = V_k @ basis  # (n, oc, ic) — reconstruct for residual computation
     W_quant = W - W_share  # (n, oc, ic) — residual to be quantized
 
     # Step 2: Hessian from calibration activations
@@ -62,7 +63,8 @@ def w_quantize(
     vq = vq_quantize(W_quant, H, cfg)
 
     return WeightQuantization(
-        w_share=W_share.half(),
+        idre_vk=V_k.half(),
+        idre_basis=basis.half(),
         vq=vq,
         n_experts=n,
         oc=oc,
@@ -72,9 +74,12 @@ def w_quantize(
 
 @dataclasses.dataclass
 class WeightQuantization:
-    # IDRE shared component — kept at full precision
-    w_share: torch.Tensor
-    """Shared low-rank component. Shape: (n_experts, oc, ic). float16."""
+    # IDRE shared component — stored in factored form for compression
+    idre_vk: torch.Tensor
+    """Per-expert coefficients. Shape: (n_experts, oc, k). float16."""
+
+    idre_basis: torch.Tensor
+    """Shared low-rank basis. Shape: (k, ic). float16."""
 
     # VPTQ compressed residual
     vq: VQResult
@@ -99,8 +104,9 @@ class WeightQuantization:
             W_vq: Reconstructed weight.
                 Shape: (n_experts, oc, ic). float32.
         """
+        W_share = (self.idre_vk.float() @ self.idre_basis.float())
         W_quant_vq = vq_reconstruct(self.vq, self.n_experts, self.oc, self.ic)
-        return self.w_share.float() + W_quant_vq.float().to(self.w_share.device)
+        return W_share + W_quant_vq.float().to(self.idre_vk.device)
 
     def to_tensors(self, prefix: str) -> dict[str, torch.Tensor]:
         """Flatten to a dict of named tensors for safetensors serialization.
@@ -118,7 +124,8 @@ class WeightQuantization:
         p = prefix
 
         tensors = {
-            f"{p}.w_share": self.w_share.contiguous().cpu(),
+            f"{p}.idre_vk": self.idre_vk.contiguous().cpu(),
+            f"{p}.idre_basis": self.idre_basis.contiguous().cpu(),
             f"{p}.main_indices": self.vq.main_indices.contiguous().cpu(),
             f"{p}.main_codebooks": self.vq.main_codebooks.contiguous().cpu(),
             f"{p}.col_invperm": self.vq.col_invperm.contiguous().cpu(),
@@ -140,14 +147,13 @@ class WeightQuantization:
             tensors[f"{p}.bcos_scale"] = self.bcos_scale.contiguous().cpu()
         if self.bcos_bias is not None:
             tensors[f"{p}.bcos_bias"] = self.bcos_bias.contiguous().cpu()
-
         return tensors
 
     @classmethod
     def from_tensors(
         cls, tensors: dict[str, torch.Tensor], prefix: str
     ) -> WeightQuantization:
-        """Reconstruct a QuantizedWeight from a flat tensor dict.
+        """Reconstruct a WeightQuantization from a flat tensor dict.
 
         Inverse of to_tensors(). Use after loading from safetensors.
 
@@ -156,7 +162,7 @@ class WeightQuantization:
             prefix: Same prefix used in to_tensors().
 
         Returns:
-            QuantizedWeight with all fields populated.
+            WeightQuantization with all fields populated.
         """
         p = prefix
         meta = tensors[f"{p}.meta"]
@@ -176,7 +182,8 @@ class WeightQuantization:
         )
 
         return cls(
-            w_share=tensors[f"{p}.w_share"],
+            idre_vk=tensors[f"{p}.idre_vk"],
+            idre_basis=tensors[f"{p}.idre_basis"],
             vq=vq,
             bcos_scale=tensors.get(f"{p}.bcos_scale"),
             bcos_bias=tensors.get(f"{p}.bcos_bias"),
