@@ -26,7 +26,7 @@ class VQResult:
     """
 
     main_indices: torch.Tensor
-    """Main codebook indices. int32."""
+    """Main codebook indices. Dtype chosen by QuantConfig.index_dtype (uint8/int16/int32)."""
 
     main_codebooks: torch.Tensor
     """Main codebook centroids. float16."""
@@ -143,7 +143,7 @@ def vq_quantize(
     print(f"[vq_quantize] {n} experts, V={V}, K={K}: {time.time() - t0:.1f}s")
 
     return VQResult(
-        main_indices=torch.from_numpy(indices_np.copy()),
+        main_indices=torch.from_numpy(indices_np.copy()).to(cfg.index_dtype),
         main_codebooks=torch.from_numpy(codebooks_np.copy()).half(),
         oc_pad=oc_pad,
         oc_padded=oc_padded,

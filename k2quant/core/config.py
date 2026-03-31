@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import torch
+
 
 @dataclasses.dataclass
 class QuantConfig:
@@ -49,3 +51,20 @@ class QuantConfig:
         Each subvector index is 8 bits, encoding 2 bits per scalar weight.
         """
         return 2 ** (self.vq_bits * self.vq_d)
+
+    @property
+    def index_dtype(self) -> torch.dtype:
+        """Smallest unsigned-capable dtype for codebook indices.
+
+        Uses true unsigned types (uint8/uint16) where possible to maximize
+        the representable range per byte. Since safetensors doesn't support
+        uint16/uint32, serialization stores these as same-width signed types
+        and view-casts back on load.
+        """
+        K = self.codebook_size
+        if K <= 256:
+            return torch.uint8
+        elif K <= 65536:
+            return torch.uint16
+        else:
+            return torch.int32

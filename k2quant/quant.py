@@ -123,10 +123,21 @@ class WeightQuantization:
         """
         p = prefix
 
+        # safetensors doesn't support uint16/uint32, so view-cast to
+        # same-width signed type for storage. from_tensors() reverses this.
+        indices = self.vq.main_indices.contiguous().cpu()
+        _STORAGE_DTYPE = {
+            torch.uint8: torch.uint8,
+            torch.uint16: torch.int16,
+            torch.int16: torch.int16,
+            torch.int32: torch.int32,
+        }
+        indices = indices.view(_STORAGE_DTYPE[indices.dtype])
+
         tensors = {
             f"{p}.idre_vk": self.idre_vk.contiguous().cpu(),
             f"{p}.idre_basis": self.idre_basis.contiguous().cpu(),
-            f"{p}.main_indices": self.vq.main_indices.contiguous().cpu(),
+            f"{p}.main_indices": indices,
             f"{p}.main_codebooks": self.vq.main_codebooks.contiguous().cpu(),
             f"{p}.col_invperm": self.vq.col_invperm.contiguous().cpu(),
             f"{p}.meta": torch.tensor(
@@ -171,8 +182,18 @@ class WeightQuantization:
         oc_pad, oc_padded = meta_list[3], meta_list[4]
         ic_pad, ic_padded = meta_list[5], meta_list[6]
 
+        # Reverse the view-cast applied in to_tensors(): int16 on disk
+        # was originally uint16 (unsigned indices for codebook lookup).
+        raw_indices = tensors[f"{p}.main_indices"]
+        _LOAD_DTYPE = {
+            torch.uint8: torch.uint8,
+            torch.int16: torch.uint16,
+            torch.int32: torch.int32,
+        }
+        indices = raw_indices.view(_LOAD_DTYPE.get(raw_indices.dtype, raw_indices.dtype))
+
         vq = VQResult(
-            main_indices=tensors[f"{p}.main_indices"],
+            main_indices=indices,
             main_codebooks=tensors[f"{p}.main_codebooks"],
             oc_pad=oc_pad,
             oc_padded=oc_padded,
