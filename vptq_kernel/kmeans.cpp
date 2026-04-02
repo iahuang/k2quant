@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -347,7 +349,9 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
     auto centroids_next = owned_mat_2d(k, D);
     auto weights_sum = std::make_unique<float[]>(k);
     auto assignments = std::make_unique<int[]>(N);
-    auto dist_buf = std::make_unique<float[]>(k * 4);
+    constexpr int NUM_THREADS = 32;
+    // Each thread needs its own dist_buf (k * BATCH floats)
+    auto dist_bufs = std::make_unique<float[]>(k * 4 * NUM_THREADS);
 
     auto cv = centroids.view();
     kmeans_centroid_init(data, cv, k);
@@ -356,7 +360,25 @@ owned_mat_2d weighted_kmeans_train(const matview_2d& data, const float* weights,
 
     for (int iter = 0; iter < niter; iter++) {
         cv = centroids.view();
-        unweighted_kmeans_assign_transposed(assignments.get(), ct, data, dist_buf.get());
+
+        // Parallel assignment across NUM_THREADS threads
+        {
+            std::vector<std::thread> threads;
+            threads.reserve(NUM_THREADS);
+            int chunk = (N + NUM_THREADS - 1) / NUM_THREADS;
+            for (int t = 0; t < NUM_THREADS; t++) {
+                int start = t * chunk;
+                int end = std::min(start + chunk, N);
+                if (start >= end) break;
+                threads.emplace_back([&, start, end, t]() {
+                    matview_2d points_slice(const_cast<float*>(data[start]), end - start, D);
+                    float* my_dist_buf = dist_bufs.get() + t * k * 4;
+                    unweighted_kmeans_assign_transposed(
+                        assignments.get() + start, ct, points_slice, my_dist_buf);
+                });
+            }
+            for (auto& th : threads) th.join();
+        }
         auto centroids_next_view = centroids_next.view();
 
         centroids_next_view.inplace_zero();
