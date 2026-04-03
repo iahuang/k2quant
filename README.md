@@ -1,35 +1,55 @@
 # k2quant
 
-Minimally lossy 2-bit post-training quantization of MoE language models using [KBVQ-MoE (Xu et al., 2026)](https://arxiv.org/abs/2602.11184) and [VPTQ (Liu et al., 2024)](https://arxiv.org/abs/2409.17066).
+A post-training quantization toolkit for compressing mixture-of-experts (MoE) language models to 2 bits per parameter with minimal accuracy loss.
 
-k2quant extends the original findings of KBVQ-MoE by swapping the VQ step for a variant of VPTQ which makes the following modification:
+k2quant combines [KBVQ-MoE (Xu et al., 2026)](https://arxiv.org/abs/2602.11184) with a modified variant of [VPTQ (Liu et al., 2024)](https://arxiv.org/abs/2409.17066), composing input-driven low-rank factorization with second-order vector quantization. It is, to our knowledge, the first publicly available implementation of KBVQ-MoE.
 
-- Propagates errors over the columns of the weight matrix sorted by the inverse of the Hessian. This is a unique contribution of k2quant and empirically improves perplexity.
-- Removes the residual VQ step from the pipeline, as this was found to contribute diminishing returns.
+For a detailed write-up, see the [accompanying blog post](https://ianhuang.dev/blog/k2quant).
 
-## Comparison to Published Results
+## Approach
 
-On the `Qwen1.5-MoE-A2.7B` model, we compare the perplexity (PPL) of the FP16 baseline and the results reported in the original paper. The authors evaluate their results using KBVQ-MoE using a naive VQ algorithm and using VPTQ.
+KBVQ-MoE factors each expert's FFN weights into a shared low-rank component (kept at full precision) and a per-expert residual (compressed via VQ). k2quant extends this by replacing the naive VQ step with a variant of VPTQ, with the following modifications:
 
-| Method                           | PPL (WikiText2) ↓ |
-| -------------------------------- | ----------------- |
-| _FP16 Baseline_                  | 7.22              |
-| KBVQ-MoE (reported)              | 9.61              |
-| KBVQ-MoE + VPTQ (reported)       | 8.78              |
-| **k2quant (no column ordering)** | 8.13              |
-| **k2quant**                      | **7.50**          |
+- **Hessian-ordered error propagation.** Quantization errors are propagated over columns sorted by inverse Hessian diagonal, prioritizing corrections to the most sensitive dimensions first. This technique was present in VPTQ's reference implementation but undocumented in the paper; it empirically improves perplexity.
+- **No residual VQ.** The residual quantization stage from the original VPTQ pipeline is removed, as it was found to yield diminishing returns in this setting.
 
-## Results on All Tested Models
+## Performance
 
-Perplexity measured on the WikiText2 dataset. Model size informs minimum VRAM requirement. Some weights (e.g. embeddings, attention matrices) are left in their original precision, due to their high sensitivity and small relative size.
+### Optimized C++ quantization kernel
 
-| Model               | Total / Active Parameters | PPL - FP16 | PPL - Quantized ↓ | Size - FP16 | Size - Quantized ↓ |
-| ------------------- | ------------------------- | ---------- | ----------------- | ----------- | ------------------ |
-| `Qwen1.5-MoE-A2.7B` | 14.3B / 2.7B              | 7.22       | 7.50              | 29 GB       | ?                  |
-| `Qwen3.5-35B-A3B`   | 35B / 3B                  | 7.17       | 8.08              | 67 GB       | 22.2 GB (~3x)      |
-| `Mixtral-8x7B-v0.1` | 46.7B / 12.9B             | ?          | ?                 | ?           | ?                  |
+The VPTQ quantization step (K-means clustering and error propagation) is implemented in C++ with pybind11, using OpenBLAS for matrix operations and template-specialized distance computations tuned for small vector dimensions.
 
-## Next Steps
+On LLaMA-2 13B (dense VPTQ-only, as a standard benchmark), this achieves **~50 minutes end-to-end on a single A100**, compared to ~4 hours on a 4x A100 cluster as reported by the original VPTQ authors—a roughly 20x improvement in compute-cost efficiency.
 
-- [ ] Add support for more models. Add support for memory/disk offloading to allow for quantization of models larger than VRAM budget.
-- [ ] Perform more extensive studies: impact of residual propagation, sub-2 bit quantization, and more.
+### Quantization quality
+
+On `Qwen1.5-MoE-A2.7B` (WikiText2 perplexity, lower is better):
+
+| Method                     | PPL — FP16 | PPL — 2-bit ↓ | Degradation ↓ |
+| -------------------------- | ---------- | ------------- | ------------- |
+| KBVQ-MoE (reported)        | 7.22       | 9.61          | +2.39         |
+| KBVQ-MoE + VPTQ (reported) | 7.22       | 8.78          | +1.56         |
+| **k2quant (KBVQ only)**    | 7.49       | 9.03          | +1.54         |
+| **k2quant (KBVQ + VPTQ)**  | 7.49       | **8.61**      | **+1.12**     |
+
+### Results across models
+
+Perplexity measured on WikiText2. Some weights (e.g. embeddings, attention matrices) are left at original precision due to high sensitivity and small relative size.
+
+| Model               | Total / Active Params | PPL — FP16 | PPL — Quantized ↓ | Size — FP16 | Size — Quantized ↓      |
+| ------------------- | --------------------- | ---------- | ----------------- | ----------- | ----------------------- |
+| `Qwen1.5-MoE-A2.7B` | 14.3B / 2.7B          | 7.22       | 7.50              | 29 GB       | 7.1 GB (4x compression) |
+
+## Project structure
+
+```
+k2quant/          # Python package — pipeline, model adapters, quantization logic
+vptq_kernel/      # C++ kernel — K-means clustering, error propagation (pybind11)
+tests/            # Unit tests
+```
+
+## Next steps
+
+- Inference integration: write dequantization kernels for frameworks like [MLX](https://github.com/ml-explore/mlx), [vLLM](https://github.com/vllm-project/vllm), and [SGLang](https://github.com/sgl-project/sglang).
+- Support for additional models and memory/disk offloading for models larger than VRAM budget.
+- Further studies on the impact of Hessian-ordered error propagation, sub-2-bit quantization, and other configurations.
