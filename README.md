@@ -4,7 +4,7 @@ A post-training quantization toolkit for compressing mixture-of-experts (MoE) la
 
 k2quant combines [KBVQ-MoE (Xu et al., 2026)](https://arxiv.org/abs/2602.11184) with a modified variant of [VPTQ (Liu et al., 2024)](https://arxiv.org/abs/2409.17066), composing input-driven low-rank factorization with second-order vector quantization. It is, to our knowledge, the first publicly available implementation of KBVQ-MoE.
 
-For a detailed write-up, see the [accompanying blog post](https://ianhuang.dev/blog/k2quant).
+For a detailed write-up, see the [accompanying blog post](https://ianhuang.dev/blog/quantization-llm-inference).
 
 ## Approach
 
